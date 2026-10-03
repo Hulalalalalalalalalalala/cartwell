@@ -54,3 +54,9 @@ curl -X POST http://127.0.0.1:8080/api/products \
 curl http://127.0.0.1:8080/health
 curl http://127.0.0.1:8080/api/products
 ```
+
+运行回归测试（通过真实接口请求验证新增商品与重复规格判定行为）：
+
+```sh
+npm test
+```
