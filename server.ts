@@ -546,6 +546,7 @@ const ERROR_PAGE = (message: string): string => `<!doctype html>
 // ---------- HTTP 服务 ----------
 
 function respond(res: ServerResponse, status: number, value: unknown, html = false, allow?: string): void {
+  if (res.destroyed || res.writableEnded) return; // 客户端可能已在读取请求体期间断开
   const body = html ? String(value) : JSON.stringify(value);
   const headers: Record<string, string> = {
     'content-type': html ? 'text/html; charset=utf-8' : 'application/json; charset=utf-8',
@@ -560,23 +561,37 @@ function readJsonBody(req: IncomingMessage): Promise<unknown> {
   return new Promise((resolve, reject) => {
     let size = 0;
     const chunks: Buffer[] = [];
+    let bodyTooLarge = false;
+    let settled = false;
+    const fail = (reason: 'too-large' | 'invalid-json'): void => {
+      if (settled) return;
+      settled = true;
+      reject(new Error(reason));
+    };
     req.on('data', (chunk: Buffer) => {
       size += chunk.length;
+      if (bodyTooLarge) return; // 已确认超限，继续排空后续数据即可
+      // 超限只标记、停止缓存，绝不销毁连接：未读完的请求数据会导致随后写出的响应被
+      // TCP RST，客户端只能看到连接重置。继续读完整个请求体后再在 'end' 中拒绝。
       if (size > MAX_BODY_BYTES) {
-        reject(new Error('request body too large'));
-        req.destroy();
+        bodyTooLarge = true;
+        chunks.length = 0;
         return;
       }
       chunks.push(chunk);
     });
     req.on('end', () => {
+      if (bodyTooLarge) {
+        fail('too-large');
+        return;
+      }
       try {
         resolve(JSON.parse(Buffer.concat(chunks).toString('utf8')));
       } catch {
-        reject(new Error('invalid JSON'));
+        fail('invalid-json');
       }
     });
-    req.on('error', () => reject(new Error('invalid JSON')));
+    req.on('error', () => fail(bodyTooLarge ? 'too-large' : 'invalid-json'));
   });
 }
 
@@ -641,8 +656,11 @@ const server = createServer((req: IncomingMessage, res: ServerResponse): void =>
     }
     respond(res, 201, product);
   }).catch((error: Error) => {
-    if (error.message === 'request body too large') {
-      respond(res, 400, { error: '请求体超过大小限制' });
+    if (error.message === 'too-large') {
+      respond(res, 400, {
+        error: `请求体超过 ${MAX_BODY_BYTES} 字节的大小限制，商品没有保存`,
+        limitBytes: MAX_BODY_BYTES,
+      });
     } else {
       respond(res, 400, { error: '请求内容不是合法的 JSON' });
     }

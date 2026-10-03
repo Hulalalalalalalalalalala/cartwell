@@ -5,6 +5,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { once } from 'node:events';
+import net from 'node:net';
 
 // 回归测试：通过真实的 HTTP 请求、响应和保存后的商品列表观察新增商品行为，
 // 重点保证同一商品内重复规格的判定不随属性填写顺序变化。
@@ -76,6 +77,102 @@ async function getProducts(url: string): Promise<any[]> {
   const body = await response.json();
   assert.ok(Array.isArray(body.products));
   return body.products;
+}
+
+const MAX_BODY_BYTES = 1_048_576;
+
+interface RawResponse {
+  statusLine: string;
+  statusCode: number;
+  headers: string;
+  body: Buffer;
+  hadError: boolean;
+}
+
+// 直接用 TCP 发送原始 HTTP 请求，便于精确控制 Content-Length、分块边界和发送节奏，
+// 同时观察连接是否被重置以及响应是否完整（fetch 无法区分「连接断开」与「400 响应」）。
+function rawRequest(url: string, headExtra: string, chunks: Buffer[]): Promise<RawResponse> {
+  const { port } = new URL(url);
+  return new Promise((resolve, reject) => {
+    const client = net.connect(Number(port), '127.0.0.1');
+    const received: Buffer[] = [];
+    client.on('connect', () => {
+      client.write(`POST /api/products HTTP/1.1\r\nHost: localhost\r\n${headExtra}\r\n\r\n`);
+      let index = 0;
+      const sendNext = (): void => {
+        if (index >= chunks.length) { client.end(); return; }
+        client.write(chunks[index++]);
+        setImmediate(sendNext);
+      };
+      sendNext();
+    });
+    client.on('data', (chunk) => received.push(chunk));
+    client.on('error', (error) => reject(error));
+    client.on('close', (hadError) => {
+      const raw = Buffer.concat(received);
+      const split = raw.indexOf('\r\n\r\n');
+      const head = split >= 0 ? raw.subarray(0, split).toString('utf8') : '';
+      const statusLine = head.split('\r\n')[0] ?? '';
+      const statusCode = Number(statusLine.slice(9, 12)) || 0;
+      let body = split >= 0 ? raw.subarray(split + 4) : Buffer.alloc(0);
+      if (/transfer-encoding:\s*chunked/i.test(head)) body = dechunk(body);
+      resolve({ statusLine, statusCode, headers: head, body, hadError });
+    });
+  });
+}
+
+function dechunk(payload: Buffer): Buffer {
+  const out: Buffer[] = [];
+  let rest = payload;
+  for (;;) {
+    const lineEnd = rest.indexOf('\r\n');
+    if (lineEnd < 0) break;
+    const length = parseInt(rest.subarray(0, lineEnd).toString('ascii'), 16);
+    if (!Number.isFinite(length) || length <= 0) break;
+    out.push(rest.subarray(lineEnd + 2, lineEnd + 2 + length));
+    rest = rest.subarray(lineEnd + 2 + length + 2);
+  }
+  return Buffer.concat(out);
+}
+
+async function postRawWithLength(url: string, body: Buffer, chunks?: Buffer[]): Promise<RawResponse> {
+  return rawRequest(url, `Content-Type: application/json\r\nContent-Length: ${body.length}`, chunks ?? [body]);
+}
+
+async function postRawChunked(url: string, body: Buffer, segmented = false): Promise<RawResponse> {
+  // 把实际内容按每 100_000 字节编码成 chunked 数据帧
+  const frames: string[] = [];
+  for (let offset = 0; offset < body.length; offset += 100_000) {
+    const piece = body.subarray(offset, Math.min(offset + 100_000, body.length));
+    frames.push(`${piece.length.toString(16)}\r\n${piece.toString('latin1')}\r\n`);
+  }
+  frames.push('0\r\n\r\n');
+  const wire = Buffer.from(frames.join(''), 'latin1');
+  if (!segmented) return rawRequest(url, 'Content-Type: application/json\r\nTransfer-Encoding: chunked', [wire]);
+  // 帧本身再按 300_000 字节边界拆成多次 TCP 写入（与 chunk 边界刻意不对齐）
+  const sendChunks: Buffer[] = [];
+  for (let offset = 0; offset < wire.length; offset += 300_000) {
+    sendChunks.push(wire.subarray(offset, Math.min(offset + 300_000, wire.length)));
+  }
+  return rawRequest(url, 'Content-Type: application/json\r\nTransfer-Encoding: chunked', sendChunks);
+}
+
+// 断言超限响应完整、可解析，且原因明确是「超过大小限制」而不是字段校验或 JSON 错误。
+function assertTooLargeResponse(result: RawResponse): any {
+  assert.equal(result.statusCode, 400, `超限请求应返回 400，实际：${result.statusLine}`);
+  assert.ok(!result.hadError, '连接不应被重置，客户端应收到完整响应');
+  assert.match(result.headers, /content-length:\s*\d+/i, '响应应带正确的 content-length');
+  assert.equal(
+    result.body.length,
+    Number(result.headers.match(/content-length:\s*(\d+)/i)![1]),
+    '响应正文应与 content-length 一致，不能是半截响应',
+  );
+  let parsed: any;
+  assert.doesNotThrow(() => { parsed = JSON.parse(result.body.toString('utf8')); }, '响应应是可解析的完整 JSON');
+  assert.match(parsed.error, /请求体超过/, '错误说明应指出请求体超过大小限制');
+  assert.match(parsed.error, /商品没有保存|未保存|没有保存/, '错误说明应明确商品没有保存');
+  assert.equal(parsed.limitBytes, MAX_BODY_BYTES);
+  return parsed;
 }
 
 function spec(attributes: Array<[string, string]>, price = '10.00', stock = 5) {
@@ -274,4 +371,169 @@ test('重复限制只作用于同一次新增的商品：不同商品允许相�
     [third.body.id, second.body.id, first.body.id],
     '三个商品都应保存，且最新创建的商品排在最前',
   );
+});
+
+// ---------- 请求体大小限制 ----------
+
+// 构造在某个属性值里填充 n 个 ASCII 字符的商品 JSON；每多一个字符请求体恰好多一个字节。
+function paddedProductJson(pad: number, price = '1.00'): Buffer {
+  return Buffer.from(JSON.stringify({
+    name: '边界商品',
+    specs: [{ attributes: [{ name: '颜色', value: 'a'.repeat(pad) }], price, stock: 1 }],
+  }), 'utf8');
+}
+
+// 找到请求体字节数不超过上限的最大填充长度（ASCII 填充时可恰好凑到上限）。
+function maxPadWithinLimit(price = '1.00'): number {
+  let lo = 0;
+  let hi = MAX_BODY_BYTES;
+  while (lo < hi) {
+    const mid = Math.floor((lo + hi + 1) / 2);
+    if (paddedProductJson(mid, price).length <= MAX_BODY_BYTES) lo = mid;
+    else hi = mid - 1;
+  }
+  return lo;
+}
+
+test('请求体超过上限（一次性发送）时返回完整可解析的 400 JSON，而不是重置连接', async (t) => {
+  const server = await startServer();
+  t.after(() => stopServer(server));
+
+  const result = await postRawWithLength(server.url, Buffer.alloc(MAX_BODY_BYTES + 1, 0x78));
+  assertTooLargeResponse(result);
+  assert.deepEqual(await getProducts(server.url), [], '超限请求不能创建商品或部分规格');
+});
+
+test('同一份超限内容：整体发送、分多段发送、chunked 分段传输得到一致的超限 400', async (t) => {
+  const server = await startServer();
+  t.after(() => stopServer(server));
+
+  const body = paddedProductJson(maxPadWithinLimit() + 1);
+  assert.ok(body.length > MAX_BODY_BYTES);
+
+  // 预先声明长度并一次性发送
+  const bulk = await postRawWithLength(server.url, body);
+  // 预先声明相同长度，但把请求体切成多段发送
+  const segments: Buffer[] = [];
+  for (let offset = 0; offset < body.length; offset += 200_000) {
+    segments.push(body.subarray(offset, Math.min(offset + 200_000, body.length)));
+  }
+  assert.ok(segments.length > 1, '测试前提：内容确实被分成多段');
+  const split = await postRawWithLength(server.url, body, segments);
+  // 使用 Transfer-Encoding: chunked，帧本身也分多次写入（写入边界与 chunk 边界不对齐）
+  const one = await postRawChunked(server.url, body, true);
+  // chunked 数据一次性写入
+  const chunkedBulk = await postRawChunked(server.url, body);
+
+  for (const result of [bulk, split, one, chunkedBulk]) {
+    assertTooLargeResponse(result);
+  }
+  assert.ok(
+    bulk.body.equals(split.body) && bulk.body.equals(one.body) && bulk.body.equals(chunkedBulk.body),
+    '不同发送方式应返回完全一致的响应',
+  );
+  assert.deepEqual(await getProducts(server.url), []);
+});
+
+test('恰好达到上限的合法请求进入原有校验并创建成功，只多一个字节才按超限拒绝', async (t) => {
+  const server = await startServer();
+  t.after(() => stopServer(server));
+
+  const pad = maxPadWithinLimit();
+  const exact = paddedProductJson(pad);
+  assert.equal(exact.length, MAX_BODY_BYTES, '测试前提：请求体恰好等于上限');
+  const exactResult = await postRawWithLength(server.url, exact);
+  assert.equal(exactResult.statusCode, 201, '恰好达到上限的合法请求应创建成功');
+  assert.match(exactResult.body.toString('utf8'), /"id"/);
+
+  const over = paddedProductJson(pad + 1);
+  assert.equal(over.length, MAX_BODY_BYTES + 1);
+  assertTooLargeResponse(await postRawWithLength(server.url, over));
+});
+
+test('恰好达到上限但内容不是合法 JSON 时仍按 JSON 错误拒绝，只有超过上限才算请求过大', async (t) => {
+  const server = await startServer();
+  t.after(() => stopServer(server));
+
+  // 未闭合的对象（前缀后全部填 JSON 空白），恰好 1 MiB，解析必然失败但与大小无关
+  const invalid = Buffer.concat([
+    Buffer.from('{"x":'),
+    Buffer.alloc(MAX_BODY_BYTES - 5, 0x20),
+  ]);
+  assert.equal(invalid.length, MAX_BODY_BYTES);
+  const result = await postRawWithLength(server.url, invalid);
+  assert.equal(result.statusCode, 400);
+  const parsed = JSON.parse(result.body.toString('utf8'));
+  assert.equal(parsed.error, '请求内容不是合法的 JSON', '恰好上限不应被误报为超限');
+});
+
+test('超过上限时即使同时是非法 JSON，也只报超限原因', async (t) => {
+  const server = await startServer();
+  t.after(() => stopServer(server));
+
+  const invalid = Buffer.from(`{ not json ${'z'.repeat(MAX_BODY_BYTES)}}`);
+  assert.ok(invalid.length > MAX_BODY_BYTES);
+  assertTooLargeResponse(await postRawWithLength(server.url, invalid));
+  assert.deepEqual(await getProducts(server.url), []);
+});
+
+test('超过上限时即使同时包含非法售价等字段问题，也只报超限而不是字段不合规', async (t) => {
+  const server = await startServer();
+  t.after(() => stopServer(server));
+
+  const pad = maxPadWithinLimit('-99');
+  const body = paddedProductJson(pad + 1, '-99');
+  assert.ok(body.length > MAX_BODY_BYTES);
+  const parsed = assertTooLargeResponse(await postRawWithLength(server.url, body));
+  assert.equal(parsed.details, undefined, '不能把超限请求误报成商品字段不合规');
+  assert.deepEqual(await getProducts(server.url), []);
+});
+
+test('大小限制按 UTF-8 字节计算：字符数未超限但字节数超限的中文属性同样拒绝', async (t) => {
+  const server = await startServer();
+  t.after(() => stopServer(server));
+
+  // 每个「红」字占 3 个字节：约 35 万个字符就超过 1 MiB，字符数远小于字节上限。
+  const body = Buffer.from(JSON.stringify({
+    name: '中文商品',
+    specs: [{ attributes: [{ name: '颜色', value: '红'.repeat(400_000) }], price: '1.00', stock: 1 }],
+  }), 'utf8');
+  assert.ok(body.length < 3 * 400_000 + 1000 && body.length > MAX_BODY_BYTES);
+  assertTooLargeResponse(await postRawWithLength(server.url, body));
+  assert.deepEqual(await getProducts(server.url), []);
+});
+
+test('处理超限请求后已有商品、售价和库存保持原样，且仍能正常新增另一件合法商品', async (t) => {
+  const server = await startServer();
+  t.after(() => stopServer(server));
+
+  const existing = await postProduct(server.url, productPayload('已有商品', [
+    spec([['颜色', '黑色'], ['尺码', 'S']], '59.00', 12),
+    spec([['颜色', '黑色'], ['尺码', 'M']], '69.5', 0),
+  ]));
+  assert.equal(existing.status, 201);
+  const before = await getProducts(server.url);
+
+  // 连续两次超限（一次 chunked、一次声明长度），其中一次还夹带非法售价
+  assertTooLargeResponse(await postRawChunked(server.url, Buffer.alloc(MAX_BODY_BYTES + 10, 0x71)));
+  const pad = maxPadWithinLimit('-1');
+  assertTooLargeResponse(await postRawWithLength(server.url, paddedProductJson(pad + 1, '-1')));
+
+  const after = await getProducts(server.url);
+  assert.deepEqual(after, before, '此前保存的商品、售价和库存保持原样');
+  assert.ok(
+    after.every((product) => product.name === '已有商品'),
+    '超限商品不能出现在列表中，也不能留下部分规格',
+  );
+
+  // 服务仍可正常查询与新增
+  const another = await postProduct(server.url, productPayload('另一件合法商品', [
+    spec([['颜色', '白色']], '39.90', 3),
+  ]));
+  assert.equal(another.status, 201);
+  assert.equal(another.body.specs[0].price, '39.90', '金额仍以两位小数字符串展示');
+  const finalList = await getProducts(server.url);
+  assert.equal(finalList.length, 2);
+  assert.equal(finalList[0].id, another.body.id, '新商品排在列表最前');
+  assert.deepEqual(finalList[1], before[0], '此前的商品记录完整保留');
 });
