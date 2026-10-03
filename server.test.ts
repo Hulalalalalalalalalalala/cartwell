@@ -5,6 +5,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { once } from 'node:events';
+import http from 'node:http';
 
 // 回归测试：通过真实的 HTTP 请求、响应和保存后的商品列表观察新增商品行为，
 // 重点保证同一商品内重复规格的判定不随属性填写顺序变化。
@@ -76,6 +77,78 @@ async function getProducts(url: string): Promise<any[]> {
   const body = await response.json();
   assert.ok(Array.isArray(body.products));
   return body.products;
+}
+
+// 绕过 fetch 直接操作底层请求：可以精确控制 Content-Length/分块传输以及 TCP 分段，
+// 并把连接重置暴露成 connectionError，而不是让它以异常形式中断测试。
+interface RawResult {
+  status: number;
+  body: string;
+  connectionError?: string;
+}
+
+async function postRaw(
+  url: string,
+  payload: Buffer,
+  options: { chunked?: boolean; splitAt?: number } = {},
+): Promise<RawResult> {
+  return new Promise((resolve) => {
+    const target = new URL(url);
+    const headers: Record<string, string> = { 'content-type': 'application/json' };
+    if (!options.chunked) headers['content-length'] = String(payload.length);
+    const req = http.request(
+      {
+        host: target.hostname,
+        port: target.port,
+        path: '/api/products',
+        method: 'POST',
+        headers,
+      },
+      (res) => {
+        const parts: Buffer[] = [];
+        res.on('data', (chunk: Buffer) => parts.push(chunk));
+        res.on('end', () => resolve({ status: res.statusCode ?? 0, body: Buffer.concat(parts).toString('utf8') }));
+      },
+    );
+    req.on('error', (error) => resolve({ status: 0, body: '', connectionError: error.code ?? error.message }));
+    if (options.splitAt === undefined) {
+      req.write(payload);
+    } else {
+      req.write(payload.subarray(0, options.splitAt));
+      req.write(payload.subarray(options.splitAt));
+    }
+    req.end();
+  });
+}
+
+function exactSizedValidProduct(targetBytes: number): Buffer {
+  const attempt = (pad: number) => Buffer.from(JSON.stringify({
+    name: '大商品',
+    specs: [{ attributes: [{ name: '颜色', value: 'a'.repeat(pad) }], price: '10.00', stock: 1 }],
+  }));
+  // 二分找到使整体恰好为 targetBytes 的填充长度
+  let lo = 0;
+  let hi = targetBytes;
+  while (lo < hi) {
+    const mid = Math.floor((lo + hi) / 2);
+    if (attempt(mid).length < targetBytes) lo = mid + 1;
+    else hi = mid;
+  }
+  const body = attempt(lo);
+  assert.equal(body.length, targetBytes, '测试用例应构造出恰好达到上限的请求体');
+  return body;
+}
+
+const MAX_BODY_BYTES = 1_048_576;
+
+function assertTooLargeRejected(result: RawResult): void {
+  assert.equal(result.connectionError, undefined, '客户端应收到完整响应，不能是连接重置或断连');
+  assert.equal(result.status, 400, '超限必须是一次新增失败，不能返回成功状态');
+  let body: any;
+  assert.doesNotThrow(() => { body = JSON.parse(result.body); }, '响应正文必须是完整可解析的 JSON');
+  assert.match(body.error, /请求体超过/, '错误说明必须明确指出请求体超过大小限制');
+  assert.match(body.error, /未保存|没有保存|未创建/, '错误说明必须明确指出商品没有保存');
+  assert.equal(body.details, undefined, '不能把超限误报成商品字段不合规');
 }
 
 function spec(attributes: Array<[string, string]>, price = '10.00', stock = 5) {
@@ -274,4 +347,157 @@ test('重复限制只作用于同一次新增的商品：不同商品允许相�
     [third.body.id, second.body.id, first.body.id],
     '三个商品都应保存，且最新创建的商品排在最前',
   );
+});
+
+test('请求体超过字节上限时（预声明长度、一次发完）返回完整 400 JSON 而不是断开连接', async (t) => {
+  const server = await startServer();
+  t.after(() => stopServer(server));
+
+  const result = await postRaw(server.url, Buffer.from('x'.repeat(MAX_BODY_BYTES + 1)));
+  assertTooLargeRejected(result);
+  assert.deepEqual(await getProducts(server.url), [], '被拒绝的请求不能留下商品或规格');
+});
+
+test('使用分块传输或把同一份内容分成多段发送，超限判断与一次发完完全一致', async (t) => {
+  const server = await startServer();
+  t.after(() => stopServer(server));
+
+  const payload = Buffer.from('x'.repeat(MAX_BODY_BYTES + 100));
+
+  const chunked = await postRaw(server.url, payload, { chunked: true });
+  assertTooLargeRejected(chunked);
+
+  // 先发一小段（此时尚未超限），再发剩余部分，结论必须相同
+  const split = await postRaw(server.url, payload, { splitAt: 100 });
+  assertTooLargeRejected(split);
+
+  assert.deepEqual(await getProducts(server.url), []);
+});
+
+test('超限请求即使同时不是合法 JSON，也说明超限原因而不是 JSON 错误', async (t) => {
+  const server = await startServer();
+  t.after(() => stopServer(server));
+
+  const payload = Buffer.concat([
+    Buffer.from('{这不是合法JSON:::'),
+    Buffer.from('y'.repeat(MAX_BODY_BYTES)),
+  ]);
+  const result = await postRaw(server.url, payload);
+  assertTooLargeRejected(result);
+});
+
+test('超限请求即使同时包含无效售价等字段问题，也只说明超限、不报字段不合规', async (t) => {
+  const server = await startServer();
+  t.after(() => stopServer(server));
+
+  const payload = Buffer.from(JSON.stringify({
+    name: '超大商品',
+    specs: [{
+      attributes: [{ name: '颜色', value: '红' }],
+      price: '-9.999', // 无效售价；若先做字段校验会产生 details
+      stock: 1,
+    }],
+    padding: 'z'.repeat(MAX_BODY_BYTES),
+  }));
+  assert.ok(payload.length > MAX_BODY_BYTES);
+
+  const result = await postRaw(server.url, payload);
+  assertTooLargeRejected(result);
+  assert.deepEqual(await getProducts(server.url), []);
+});
+
+test('中文与英文属性内容遵守同一字节上限，标点和空白同样计入请求体', async (t) => {
+  const server = await startServer();
+  t.after(() => stopServer(server));
+
+  // 每个中文字符占 3 个 UTF-8 字节，约 40 万字即超过 1MB
+  const chineseTooLarge = Buffer.from(JSON.stringify({
+    name: '中文商品',
+    specs: [{ attributes: [{ name: '属性', value: '中'.repeat(400_000) }], price: '1.00', stock: 0 }],
+  }));
+  assert.ok(chineseTooLarge.length > MAX_BODY_BYTES);
+  assertTooLargeRejected(await postRaw(server.url, chineseTooLarge));
+
+  // 同样的中文内容缩短后不超限，可以正常创建
+  const chineseOk = Buffer.from(JSON.stringify({
+    name: '中文商品',
+    specs: [{ attributes: [{ name: '属性', value: '中'.repeat(150_000) }], price: '1.00', stock: 0 }],
+  }));
+  assert.ok(chineseOk.length <= MAX_BODY_BYTES);
+  const ok = await postRaw(server.url, chineseOk);
+  assert.equal(ok.status, 201);
+  assert.deepEqual((await getProducts(server.url)).length, 1);
+});
+
+test('恰好达到字节上限的合法请求仍进入正常校验并创建，超过一个字节才拒绝', async (t) => {
+  const server = await startServer();
+  t.after(() => stopServer(server));
+
+  const exact = exactSizedValidProduct(MAX_BODY_BYTES);
+  const exactResult = await postRaw(server.url, exact);
+  assert.equal(exactResult.connectionError, undefined);
+  assert.equal(exactResult.status, 201, '恰好达到上限不能按超限拒绝');
+
+  const oversized = Buffer.concat([exact, Buffer.from('x')]);
+  assertTooLargeRejected(await postRaw(server.url, oversized));
+
+  const products = await getProducts(server.url);
+  assert.equal(products.length, 1, '超限请求不能产生记录');
+});
+
+test('处理过超限请求后，已有商品保持原样，且仍能查询列表并新增合法商品', async (t) => {
+  const server = await startServer();
+  t.after(() => stopServer(server));
+
+  const existing = await postProduct(server.url, productPayload('已有商品', [
+    spec([['颜色', '黑色'], ['尺码', 'S']], '59.00', 12),
+  ]));
+  assert.equal(existing.status, 201);
+
+  assertTooLargeRejected(await postRaw(server.url, Buffer.from('x'.repeat(MAX_BODY_BYTES + 1))));
+  assertTooLargeRejected(await postRaw(
+    server.url,
+    Buffer.from('x'.repeat(MAX_BODY_BYTES + 1)),
+    { chunked: true },
+  ));
+
+  const list = await getProducts(server.url);
+  assert.deepEqual(list, [existing.body], '此前保存的商品、售价和库存保持原样');
+
+  const next = await postProduct(server.url, productPayload('新商品', [
+    spec([['颜色', '红色']], '3.5', 7),
+  ]));
+  assert.equal(next.status, 201);
+  assert.equal(next.body.specs[0].price, '3.50', '售价仍以两位小数字符串展示');
+
+  const finalList = await getProducts(server.url);
+  assert.deepEqual(
+    finalList.map((product) => product.id),
+    [next.body.id, existing.body.id],
+    '新商品排在列表最前，超限请求未留下任何痕迹',
+  );
+});
+
+test('未超限时非法 JSON 与字段不合规的原有 400 行为保持不变', async (t) => {
+  const server = await startServer();
+  t.after(() => stopServer(server));
+
+  const badJson = await postRaw(server.url, Buffer.from('{oops}'));
+  assert.equal(badJson.status, 400);
+  assert.match(JSON.parse(badJson.body).error, /合法的 JSON/);
+
+  const invalidField = await postRaw(server.url, Buffer.from(JSON.stringify({
+    name: 'n',
+    specs: [{ attributes: [{ name: 'a', value: 'b' }], price: 'bad', stock: 1 }],
+  })));
+  assert.equal(invalidField.status, 400);
+  const body = JSON.parse(invalidField.body);
+  assert.equal(body.error, '商品校验未通过，未创建任何记录');
+  assert.ok(Array.isArray(body.details));
+  assert.deepEqual(
+    body.details.map((detail: any) => `${detail.specIndex}:${detail.field}`),
+    ['0:price'],
+    '仍应具体指出第 1 条规格的售价字段',
+  );
+  assert.deepEqual(await getProducts(server.url), []);
 });
