@@ -972,6 +972,10 @@ class CdpPage {
   continueRequest(requestId: string): Promise<any> {
     return this.send('Fetch.continueRequest', { requestId });
   }
+
+  pausedCount(): number {
+    return this.pausedQueue.length;
+  }
 }
 
 // 点击提交、在请求被拦截时（服务端尚未响应）核对按钮状态，并返回浏览器实际发送的载荷。
@@ -984,6 +988,16 @@ async function submitAndHold(page: CdpPage): Promise<{ requestId: string; payloa
     await page.eval("document.getElementById('submit-btn').disabled"),
     true,
     '提交进行中提交按钮应暂时不可用',
+  );
+  assert.equal(
+    await page.eval("Array.prototype.every.call(document.querySelectorAll('#product-form input, #product-form button'), function (el) { return el.disabled; })"),
+    true,
+    '提交进行中所有输入框与增删规格/属性按钮都应不可编辑、不可点击',
+  );
+  assert.match(
+    await page.eval("document.getElementById('form-status').textContent"),
+    /正在保存/,
+    '提交进行中应显示正在保存提示，与字段校验失败区分开',
   );
   assert.equal(typeof paused.request.postData, 'string', '拦截事件应带实际发送的请求体');
   return { requestId: paused.requestId, payload: JSON.parse(paused.request.postData) };
@@ -1123,6 +1137,54 @@ test('网页：删除规格与属性后提交与当前页面一致；字段错�
       },
     ],
   }, '被删除的规格与属性不能带上；保留的属性、售价、库存必须仍属于原来的规格，不能串位');
+
+  // 等待响应期间尝试修改与增删：表单必须保持与本次发送的载荷一致，不产生第二次提交
+  assert.deepEqual(
+    await page.eval(`(function () {
+      var cards = document.querySelectorAll('#specs [data-spec]');
+      // disabled 的输入框无法获得焦点，用户键入不会落到其中
+      var nameInput = document.querySelector('[data-name-input]');
+      var priceInput = cards[1].querySelector('[data-price]');
+      nameInput.focus();
+      var nameFocusable = document.activeElement === nameInput;
+      priceInput.focus();
+      var priceFocusable = document.activeElement === priceInput;
+      // 浏览器对 disabled 按钮的真实点击（含 click() 程序化触发）一律不派发事件
+      cards[0].querySelector('.remove-attr').click();
+      cards[1].querySelector('.remove-spec').click();
+      document.getElementById('add-spec').click();
+      cards[0].querySelector('.add-attr').click();
+      return {
+        allControlsDisabled: Array.prototype.every.call(
+          document.querySelectorAll('#product-form input, #product-form button'),
+          function (el) { return el.disabled; }
+        ),
+        nameFocusable: nameFocusable,
+        priceFocusable: priceFocusable,
+        specCount: document.querySelectorAll('#specs [data-spec]').length,
+        firstSpecAttrCount: cards[0].querySelectorAll('.attr-row').length,
+        secondSpecAttrCount: cards[1].querySelectorAll('.attr-row').length
+      };
+    })()`),
+    {
+      allControlsDisabled: true,
+      nameFocusable: false,
+      priceFocusable: false,
+      specCount: 2,
+      firstSpecAttrCount: 1,
+      secondSpecAttrCount: 2,
+    },
+    '等待期间输入框不能聚焦编辑，删规格、删属性、加规格、加属性都不能改变表单',
+  );
+  // 等待期间回车或重复触发提交都不能发起第二次请求（首个暂停事件已被取走，队列应为空）
+  await page.eval(`(function () {
+    var f = document.getElementById('product-form');
+    f.requestSubmit();
+    f.requestSubmit();
+    f.dispatchEvent(new Event('submit', { cancelable: true, bubbles: true }));
+  })()`);
+  await new Promise((resolve) => setTimeout(resolve, 100));
+  assert.equal(page.pausedCount(), 0, '等待结果期间不能再次发起提交');
   await page.continueRequest(first.requestId);
 
   await page.waitFor(
@@ -1186,10 +1248,11 @@ test('网页：删除规格与属性后提交与当前页面一致；字段错�
   })()`);
 
   const second = await submitAndHold(page);
-  // 再次提交时旧错误应先被清除：请求被拦截时服务端还没返回，页面上不应有任何错误文字或标记
+  // 再次提交时旧错误应先被清除并进入等待状态：请求被拦截时服务端还没返回，
+  // 页面应显示「正在保存」，且不应残留任何错误文字或标记
   const cleared = await page.eval(FORM_STATE_EXPR);
-  assert.equal(cleared.statusText, '');
-  assert.equal(cleared.statusClass, '');
+  assert.match(cleared.statusText, /正在保存/, '等待结果期间应显示正在保存提示');
+  assert.equal(cleared.statusClass, 'saving', '等待状态应与字段校验失败的错误样式区分开');
   assert.equal(
     await page.eval("document.querySelectorAll('#product-form .invalid').length"),
     0,

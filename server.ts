@@ -330,6 +330,9 @@ button:disabled{opacity:.6;cursor:wait}
 .err{color:#b4231a;font-size:.85rem;min-height:1em}
 #form-status{margin:.8rem 0;padding:.6rem .9rem;border-radius:.5rem;display:none}
 #form-status.error{display:block;background:#fde8e8;border:1px solid #f3b6b1;color:#8a1c14}
+#form-status.saving{display:block;background:#eef4fc;border:1px solid #b9cdea;color:#174a7c}
+form.saving{cursor:wait}
+form.saving input:disabled{background:#f3f6fb;color:#374151;opacity:1}
 .field label{display:flex;gap:.5rem;align-items:center;flex-wrap:wrap}
 .form-actions{margin-top:.8rem;display:flex;gap:.8rem;align-items:center}
 `;
@@ -340,7 +343,6 @@ const PAGE_SCRIPT = `
   var nameInput = document.getElementById('product-name');
   var specsBox = document.getElementById('specs');
   var statusBox = document.getElementById('form-status');
-  var submitBtn = document.getElementById('submit-btn');
 
   function attrRowHtml() {
     return '<div class="attr-row">'
@@ -439,6 +441,19 @@ const PAGE_SCRIPT = `
     statusBox.className = 'error';
     statusBox.textContent = '保存失败，商品未保存，请稍后重试。已有商品没有受到影响，填写内容仍然保留。';
   }
+  function showSaving() {
+    statusBox.className = 'saving';
+    statusBox.textContent = '正在保存…';
+  }
+
+  // 等待响应期间锁定全部可编辑入口：输入框、提交按钮与增删规格/属性按钮，
+  // 保证页面上的内容与本次实际发送的载荷始终一致（错误定位才不会错位）。
+  var submitting = false;
+  function setFormLocked(locked) {
+    form.classList.toggle('saving', locked);
+    var controls = form.querySelectorAll('input, button');
+    for (var i = 0; i < controls.length; i++) controls[i].disabled = locked;
+  }
 
   function collectPayload() {
     var payload = { name: nameInput.value, specs: [] };
@@ -474,8 +489,11 @@ const PAGE_SCRIPT = `
   addSpec();
   form.addEventListener('submit', function (event) {
     event.preventDefault();
+    if (submitting) return; // 回车或重复点击都不能在等待期间再次发起提交
+    submitting = true;
     clearErrors();
-    submitBtn.disabled = true;
+    setFormLocked(true);
+    showSaving();
     fetch('/api/products', {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
@@ -485,18 +503,20 @@ const PAGE_SCRIPT = `
         return { status: response.status, data: data };
       });
     }).then(function (result) {
-      submitBtn.disabled = false;
       if (result.status === 201 && result.data) {
-        window.location.assign('/');
+        window.location.assign('/'); // 成功后整页跳转，不提前清空输入
         return;
       }
+      setFormLocked(false);
+      submitting = false;
       if (result.status === 400 && result.data) {
         showFailure(result.data.error || '提交内容不符合要求', result.data.details);
       } else {
         showSaveError();
       }
     }).catch(function () {
-      submitBtn.disabled = false;
+      setFormLocked(false);
+      submitting = false;
       showSaveError();
     });
   });
