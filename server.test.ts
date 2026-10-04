@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn, spawnSync, type ChildProcess } from 'node:child_process';
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { once } from 'node:events';
@@ -1978,5 +1978,245 @@ test('网页：库存文本输入不被改写成合法整数；失败后保留�
     { attributes: [{ name: '颜色', value: '紫色' }], price: '10.00', stock: 0 },
   ], '接口保存的库存与页面展示一致：数字类型、原数值，并与原属性组合对应');
   assert.deepEqual(products[1], listBefore[0], '已有商品的规格、售价和库存始终保持原样');
+  assert.equal(products[1].id, existing.body.id);
+});
+
+// ---------- 保存失败（500）回归：服务器无法写入时合法商品不产生记录，恢复后可直接重提 ----------
+//
+// 通过在数据目录中把临时文件路径占位为目录，让服务器在真实保存阶段写盘失败：
+// saveProducts 先写 products.json.tmp 再重命名，占位目录使写入必然抛错，
+// 而 products.json 本身保持可读，已有商品列表在保存失败期间不受影响；删除占位目录即恢复。
+
+function blockSaving(dataDir: string): void {
+  mkdirSync(join(dataDir, 'products.json.tmp'));
+}
+
+function restoreSaving(dataDir: string): void {
+  rmSync(join(dataDir, 'products.json.tmp'), { recursive: true, force: true });
+}
+
+test('接口：合法商品遇到保存失败返回 500 与明确说明，已有商品原样保留、不留部分记录，恢复后同一请求正常保存', async (t) => {
+  const server = await startServer();
+  t.after(() => stopServer(server));
+
+  // 先有数件商品成功保存：不同属性组合、售价与库存，含零库存与待规范化金额
+  const existingPayloads = [
+    productPayload('已有商品甲', [spec([['颜色', '黑色'], ['尺码', 'S']], '59.00', 12)]),
+    productPayload('已有商品乙', [
+      spec([['颜色', '卡其']], '45.5', 0),
+      spec([['颜色', '卡其'], ['尺码', 'L']], '0', 1),
+    ]),
+    productPayload('已有商品丙', [spec([['款式', '限量'], ['材质', '棉']], '129', 7)]),
+  ];
+  for (const payload of existingPayloads) {
+    assert.equal((await postProduct(server.url, payload)).status, 201);
+  }
+  const before = await getProducts(server.url);
+  assert.equal(before.length, 3);
+  assert.deepEqual(
+    before.map((product) => product.name),
+    ['已有商品丙', '已有商品乙', '已有商品甲'],
+    '前提：最新创建的商品排在最前',
+  );
+
+  // 另一件合法商品：多条规格，各规格属性组合、售价与库存不同，含未规范化的金额写法
+  const pendingPayload = productPayload('  保存失败商品  ', [
+    spec([['颜色', '红色'], ['尺码', 'M']], '99.5', 20),
+    spec([['颜色', '红色'], ['尺码', 'L']], '99.95', 0),
+    spec([['颜色', '蓝色'], ['尺码', 'M']], '0', 3),
+  ]);
+
+  blockSaving(server.dataDir);
+  t.after(() => restoreSaving(server.dataDir)); // 断言失败时也恢复，不影响临时目录清理
+
+  const failed = await postProduct(server.url, pendingPayload);
+  assert.equal(failed.status, 500, '保存失败必须返回 500，而不是字段不合规的 400 或创建成功的 201');
+  assert.equal(typeof failed.body.error, 'string');
+  assert.match(failed.body.error, /保存失败/, '错误说明应明确是保存失败');
+  assert.match(failed.body.error, /未受影响/, '错误说明应明确已有商品未受影响');
+  assert.equal(failed.body.details, undefined, '保存失败不能携带字段级 details，不能伪装成校验失败');
+  assert.equal(failed.body.id, undefined, '失败响应不能返回创建成功的商品记录');
+  assert.equal(failed.body.createdAt, undefined);
+  assert.equal(failed.body.specs, undefined);
+
+  // 保存失败期间读取不受影响：列表仍只有原先的记录，各字段与顺序完全保持
+  assert.deepEqual(
+    await getProducts(server.url),
+    before,
+    '保存失败后已有商品的名称、属性、售价、库存、标识与创建时间保持原值，顺序不变',
+  );
+
+  // 保存失败不改变校验行为：不合规请求仍按 400 拒绝，证明上面的 500 来自保存过程而非输入问题
+  const invalid = await postProduct(server.url, productPayload('非法商品', [
+    spec([['颜色', '红']], '-1', 5),
+  ]));
+  assert.equal(invalid.status, 400, '保存失败期间字段校验仍然生效，合法请求的 500 不是输入问题');
+  assert.ok(Array.isArray(invalid.body.details));
+  assert.deepEqual(await getProducts(server.url), before, '400 与 500 都不能留下记录');
+
+  // 恢复保存条件：列表仍无变化，被拒商品没有留下整件或只含部分规格的记录
+  restoreSaving(server.dataDir);
+  assert.deepEqual(await getProducts(server.url), before, '被拒的新商品不能留下整件记录或只包含部分规格的记录');
+
+  // 同一合法请求直接重提：按既有功能返回 201 并排在列表最前
+  const created = await postProduct(server.url, pendingPayload);
+  assert.equal(created.status, 201, '保存条件恢复后同一合法请求应创建成功');
+  assert.equal(created.body.name, '保存失败商品', '名称仍按规则去除首尾空白');
+  assert.deepEqual(created.body.specs, [
+    { attributes: [{ name: '颜色', value: '红色' }, { name: '尺码', value: 'M' }], price: '99.50', stock: 20 },
+    { attributes: [{ name: '颜色', value: '红色' }, { name: '尺码', value: 'L' }], price: '99.95', stock: 0 },
+    { attributes: [{ name: '颜色', value: '蓝色' }, { name: '尺码', value: 'M' }], price: '0.00', stock: 3 },
+  ], '金额统一为两位小数字符串，各规格库存与属性正确对应');
+
+  const finalList = await getProducts(server.url);
+  assert.equal(finalList.length, 4);
+  assert.deepEqual(finalList[0], created.body, '新商品排在列表最前');
+  assert.deepEqual(finalList.slice(1), before, '原有商品保持原样，顺序不变');
+});
+
+test('网页：表单提交遇到保存失败时停留在当前页、保留全部填写内容且不误报字段错误，恢复后直接重提成功', async (t) => {
+  if (!CHROME_BIN) { t.skip('未找到 Chrome/Chromium，跳过网页操作回归'); return; }
+
+  const server = await startServer();
+  t.after(() => stopServer(server));
+  const browser = await CdpBrowser.launch();
+  t.after(() => browser.close());
+
+  const existing = await postProduct(server.url, productPayload('已有商品', [
+    spec([['颜色', '黑色']], '59.00', 12),
+  ]));
+  assert.equal(existing.status, 201);
+  const listBefore = await getProducts(server.url);
+
+  const page = await browser.newPage(`${server.url}/`);
+  assert.deepEqual((await page.eval(LIST_STATE_EXPR)).titles, ['已有商品'], '首页应展示已存在的商品');
+
+  // 填写合法内容：名称与属性带首尾空白，售价合法但尚未规范化
+  await page.eval(`(function () {
+    document.querySelector('[data-name-input]').value = '  保存失败商品  ';
+    document.getElementById('add-spec').click();
+    var cards = document.querySelectorAll('#specs [data-spec]');
+    cards[0].querySelector('.add-attr').click();
+    var rows = cards[0].querySelectorAll('.attr-row');
+    rows[0].querySelector('[data-attr-name]').value = '  颜色  ';
+    rows[0].querySelector('[data-attr-value]').value = '  红色  ';
+    rows[1].querySelector('[data-attr-name]').value = '尺码';
+    rows[1].querySelector('[data-attr-value]').value = ' M ';
+    cards[0].querySelector('[data-price]').value = '99.5';
+    cards[0].querySelector('[data-stock]').value = '20';
+    cards[1].querySelector('[data-attr-name]').value = '颜色';
+    cards[1].querySelector('[data-attr-value]').value = '蓝色';
+    cards[1].querySelector('[data-price]').value = '0';
+    cards[1].querySelector('[data-stock]').value = '0';
+  })()`);
+
+  blockSaving(server.dataDir);
+  t.after(() => restoreSaving(server.dataDir));
+
+  const held = await submitAndHold(page);
+  assert.deepEqual(held.payload, {
+    name: '  保存失败商品  ',
+    specs: [
+      {
+        attributes: [
+          { name: '  颜色  ', value: '  红色  ' },
+          { name: '尺码', value: ' M ' },
+        ],
+        price: '99.5',
+        stock: 20,
+      },
+      { attributes: [{ name: '颜色', value: '蓝色' }], price: '0', stock: 0 },
+    ],
+  }, '提交的载荷应与页面填写内容完全一致（含未规范化的金额与首尾空白）');
+  await page.continueRequest(held.requestId);
+
+  await page.waitFor(
+    "document.getElementById('form-status').className.indexOf('error') >= 0",
+    8000,
+    '保存失败后应显示错误状态而不是跳转到列表页',
+  );
+
+  // 停留在当前页面：显示商品未保存的提示，不误报成某条规格填写错误
+  const state = await page.eval(FORM_STATE_EXPR);
+  assert.match(state.statusText, /保存失败/, '应显示保存失败提示');
+  assert.match(state.statusText, /未保存/, '应明确商品未保存');
+  assert.equal(state.statusClass, 'error');
+  assert.equal(state.productName, '  保存失败商品  ', '商品名称原文（含首尾空白）保留');
+  assert.equal(state.nameInvalid, false, '保存失败不能把名称标记为填写错误');
+  assert.equal(state.nameErr, '');
+  assert.deepEqual(state.numbers, ['规格 1', '规格 2'], '停留在当前页面，规格编号不变');
+  assert.deepEqual(
+    state.cards.map((card: any) => [card.attrs.map((a: any) => [a.name, a.value]), card.price, card.stock]),
+    [
+      [[['  颜色  ', '  红色  '], ['尺码', ' M ']], '99.5', '20'],
+      [[['颜色', '蓝色']], '0', '0'],
+    ],
+    '全部规格的属性、售价、库存按填写原文保留，含合法但未规范化的金额与首尾空白',
+  );
+  for (const card of state.cards) {
+    assert.equal(card.priceInvalid, false, '保存失败不能把售价标记为填写错误');
+    assert.equal(card.stockInvalid, false, '保存失败不能把库存标记为填写错误');
+    assert.equal(card.priceErr, '');
+    assert.equal(card.stockErr, '');
+    assert.equal(card.specErr, '');
+    assert.equal(card.attrsErr, '');
+    for (const attr of card.attrs) {
+      assert.equal(attr.nameInvalid, false, '保存失败不能把属性标记为填写错误');
+      assert.equal(attr.valueInvalid, false);
+      assert.equal(attr.nameErr, '');
+      assert.equal(attr.valueErr, '');
+    }
+  }
+
+  // 错误响应结束后：提交按钮、输入框与增删规格/属性操作恢复可用
+  const unlocked = await page.eval(LOCK_STATE_EXPR);
+  assert.equal(unlocked.submitDisabled, false, '保存失败后提交按钮恢复可用');
+  assert.equal(unlocked.allInputsDisabled, false, '保存失败后输入框恢复可编辑');
+  assert.equal(unlocked.allButtonsDisabled, false, '保存失败后增删按钮恢复可用');
+  const toggled = await page.eval(`(function () {
+    document.getElementById('add-spec').click();
+    var afterAdd = document.querySelectorAll('#specs [data-spec]').length;
+    var cards = document.querySelectorAll('#specs [data-spec]');
+    cards[afterAdd - 1].querySelector('.remove-spec').click();
+    return { afterAdd: afterAdd, afterRemove: document.querySelectorAll('#specs [data-spec]').length };
+  })()`);
+  assert.deepEqual(toggled, { afterAdd: 3, afterRemove: 2 }, '增删规格操作恢复可用，用户不必重填整件商品');
+
+  // 原有列表继续显示失败前的内容，接口侧同样没有失败商品
+  assert.deepEqual((await page.eval(LIST_STATE_EXPR)).titles, ['已有商品'], '首页列表不出现失败商品');
+  assert.deepEqual(await getProducts(server.url), listBefore, '接口列表保持失败前的内容');
+
+  // 保存条件恢复后：保留的合法内容直接再次提交
+  restoreSaving(server.dataDir);
+  const retry = await submitAndHold(page);
+  assert.deepEqual(retry.payload, held.payload, '保留的内容可直接再次提交，无需重填');
+  await page.continueRequest(retry.requestId);
+
+  await page.waitFor(
+    "document.querySelector('[data-name-input]').value === '' && document.querySelectorAll('#product-list .product').length === 2",
+    8000,
+    '恢复后重提应成功并返回首页展示两件商品',
+  );
+  const list = await page.eval(LIST_STATE_EXPR);
+  assert.deepEqual(list.titles, ['保存失败商品', '已有商品'], '新商品排在最前，名称按去除首尾空白展示');
+  assert.deepEqual(list.products[0], {
+    name: '保存失败商品',
+    specs: [
+      { attrs: ['颜色：红色', '尺码：M'], price: '¥99.50', stock: '库存 20', outOfStock: false },
+      { attrs: ['颜色：蓝色'], price: '¥0.00', stock: '库存 0', outOfStock: true },
+    ],
+  }, '名称与属性去除首尾空白，金额统一为两位小数，零库存规格仍保存并标记缺货');
+  assert.deepEqual(list.products[1], {
+    name: '已有商品',
+    specs: [{ attrs: ['颜色：黑色'], price: '¥59.00', stock: '库存 12', outOfStock: false }],
+  }, '原有商品展示保持原样');
+
+  const products = await getProducts(server.url);
+  assert.equal(products.length, 2);
+  assert.deepEqual(products[0].specs, [
+    { attributes: [{ name: '颜色', value: '红色' }, { name: '尺码', value: 'M' }], price: '99.50', stock: 20 },
+    { attributes: [{ name: '颜色', value: '蓝色' }], price: '0.00', stock: 0 },
+  ], '接口保存的内容与页面展示一致，各规格库存与属性正确对应');
+  assert.deepEqual(products[1], listBefore[0], '已有商品记录始终保持原样');
   assert.equal(products[1].id, existing.body.id);
 });
