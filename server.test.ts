@@ -1029,6 +1029,26 @@ const FORM_STATE_EXPR = `(function () {
   };
 })()`;
 
+// 读取等待保存结果期间的锁定状态：提交按钮、所有输入框、增删规格/属性按钮是否都不可用，
+// 以及状态框是否正在显示「正在保存」，并附带尝试再次提交后实际发出的请求数量。
+const LOCK_STATE_EXPR = `(function () {
+  var inputs = document.querySelectorAll('#product-form input');
+  var buttons = document.querySelectorAll('#product-form button');
+  return {
+    statusText: document.getElementById('form-status').textContent,
+    statusClass: document.getElementById('form-status').className,
+    submitDisabled: document.getElementById('submit-btn').disabled,
+    addSpecDisabled: document.getElementById('add-spec').disabled,
+    allInputsDisabled: Array.prototype.every.call(inputs, function (el) { return el.disabled; }),
+    disabledInputCount: Array.prototype.filter.call(inputs, function (el) { return el.disabled; }).length,
+    totalInputCount: inputs.length,
+    allButtonsDisabled: Array.prototype.every.call(buttons, function (el) { return el.disabled; }),
+    disabledButtonCount: Array.prototype.filter.call(buttons, function (el) { return el.disabled; }).length,
+    totalButtonCount: buttons.length,
+    specCount: document.querySelectorAll('#specs [data-spec]').length
+  };
+})()`;
+
 const LIST_STATE_EXPR = `(function () {
   return {
     titles: Array.prototype.map.call(document.querySelectorAll('#product-list .product h3'), function (h3) { return h3.textContent; }),
@@ -1186,10 +1206,11 @@ test('网页：删除规格与属性后提交与当前页面一致；字段错�
   })()`);
 
   const second = await submitAndHold(page);
-  // 再次提交时旧错误应先被清除：请求被拦截时服务端还没返回，页面上不应有任何错误文字或标记
+  // 再次提交时旧错误应先被清除：请求被拦截时服务端还没返回，字段错误文字与标记必须清空，
+  // 同时页面应处于正在保存的等待状态，与字段校验失败区分。
   const cleared = await page.eval(FORM_STATE_EXPR);
-  assert.equal(cleared.statusText, '');
-  assert.equal(cleared.statusClass, '');
+  assert.match(cleared.statusText, /正在保存/, '等待响应期间应显示正在保存提示');
+  assert.equal(cleared.statusClass, 'saving', '等待响应期间状态框应为保存中样式，而不是错误或空白');
   assert.equal(
     await page.eval("document.querySelectorAll('#product-form .invalid').length"),
     0,
@@ -1325,4 +1346,254 @@ test('网页：删除最前面的规格后编号连续，售价错误定位到�
     name: '删除首规格商品',
     specs: [{ attrs: ['颜色：蓝色'], price: '¥12.34', stock: '库存 3', outOfStock: false }],
   }]);
+});
+
+test('网页：多规格提交等待期间整体锁定为已发送内容，回车与增删操作无效，错误定位到原规格', async (t) => {
+  if (!CHROME_BIN) { t.skip('未找到 Chrome/Chromium，跳过网页操作回归'); return; }
+
+  const server = await startServer();
+  t.after(() => stopServer(server));
+  const browser = await CdpBrowser.launch();
+  t.after(() => browser.close());
+
+  const page = await browser.newPage(`${server.url}/`);
+  // 三条规格；第一条规格先添加第二个属性再删除靠前的属性（提交前删除路径），第三条售价不合规。
+  await page.eval(`(function () {
+    document.querySelector('[data-name-input]').value = '  锁定测试商品  ';
+    document.getElementById('add-spec').click();
+    document.getElementById('add-spec').click();
+    var cards = document.querySelectorAll('#specs [data-spec]');
+    cards[0].querySelector('.add-attr').click();
+    var rows0 = cards[0].querySelectorAll('.attr-row');
+    rows0[0].querySelector('[data-attr-name]').value = '颜色';
+    rows0[0].querySelector('[data-attr-value]').value = '红色';
+    rows0[1].querySelector('[data-attr-name]').value = '尺码';
+    rows0[1].querySelector('[data-attr-value]').value = 'M';
+    rows0[0].querySelector('.remove-attr').click(); // 提交前删掉靠前属性
+    cards[0].querySelector('[data-price]').value = '10.00';
+    cards[0].querySelector('[data-stock]').value = '5';
+    function fill(card, n, v, price, stock) {
+      card.querySelector('[data-attr-name]').value = n;
+      card.querySelector('[data-attr-value]').value = v;
+      card.querySelector('[data-price]').value = price;
+      card.querySelector('[data-stock]').value = stock;
+    }
+    fill(cards[1], '颜色', '蓝色', '20.00', '0');
+    fill(cards[2], '颜色', '绿色', '1.2.3', '7');
+  })()`);
+
+  const held = await submitAndHold(page);
+  assert.deepEqual(held.payload, {
+    name: '  锁定测试商品  ',
+    specs: [
+      { attributes: [{ name: '尺码', value: 'M' }], price: '10.00', stock: 5 },
+      { attributes: [{ name: '颜色', value: '蓝色' }], price: '20.00', stock: 0 },
+      { attributes: [{ name: '颜色', value: '绿色' }], price: '1.2.3', stock: 7 },
+    ],
+  }, '拦截到的载荷应是提交时刻的内容（提交前删除的属性不带上）');
+
+  // ---- 等待结果期间：显示正在保存，且名称/属性/售价/库存与全部增删按钮都不可编辑 ----
+  const lock = await page.eval(LOCK_STATE_EXPR);
+  assert.match(lock.statusText, /正在保存/, '等待期间必须显示正在保存提示，与字段校验失败区分');
+  assert.equal(lock.statusClass, 'saving');
+  assert.equal(lock.submitDisabled, true);
+  assert.equal(lock.addSpecDisabled, true);
+  assert.equal(lock.totalInputCount, 13, '商品名称 + 三规格各两个属性输入与售价、库存');
+  assert.equal(lock.disabledInputCount, 13, '等待期间所有输入框都必须不可编辑');
+  assert.equal(lock.allInputsDisabled, true);
+  assert.equal(lock.totalButtonCount, 11);
+  assert.equal(lock.disabledButtonCount, 11, '提交、添加规格、各规格添加/删除规格与属性按钮都必须不可用');
+  assert.equal(lock.allButtonsDisabled, true);
+  assert.equal(lock.specCount, 3);
+
+  // 等待期间尝试所有改动：删除第一条规格、添加规格、在各规格增删属性、回车/编程方式再次提交。
+  const tamper = await page.eval(`(function () {
+    var cards = document.querySelectorAll('#specs [data-spec]');
+    cards[0].querySelector('.remove-spec').click();
+    cards[2].querySelector('.remove-spec').click();
+    document.getElementById('add-spec').click();
+    cards[0].querySelector('.add-attr').click();
+    cards[1].querySelector('.add-attr').click();
+    cards[0].querySelector('.remove-attr').click();
+    document.getElementById('product-form').requestSubmit();
+    document.getElementById('product-form').dispatchEvent(new Event('submit', { cancelable: true, bubbles: true }));
+    return {
+      specCount: document.querySelectorAll('#specs [data-spec]').length,
+      attrCounts: Array.prototype.map.call(document.querySelectorAll('#specs [data-spec]'), function (c) {
+        return c.querySelectorAll('.attr-row').length;
+      })
+    };
+  })()`);
+  assert.equal(tamper.specCount, 3, '等待期间删除或添加规格都不能改变表单');
+  assert.deepEqual(tamper.attrCounts, [1, 1, 1], '等待期间添加或删除属性都不能改变表单');
+  const stillLocked = await page.eval(LOCK_STATE_EXPR);
+  assert.equal(stillLocked.allInputsDisabled, true, '等待期间输入框持续不可编辑');
+  assert.equal(stillLocked.statusText, lock.statusText, '等待期间持续显示正在保存，不能提前显示成功或失败');
+
+  // 回车等操作不能发起第二次提交：短时间内不应出现第二个被拦截的请求。
+  await assert.rejects(
+    page.waitPaused(700),
+    /拦截超时/,
+    '等待本次请求结束期间不能再发起一次提交',
+  );
+
+  // 已有商品列表在等待期间仍可阅读，且没有任何变化。
+  assert.deepEqual((await page.eval(LIST_STATE_EXPR)).titles, []);
+
+  await page.continueRequest(held.requestId);
+  await page.waitFor(
+    "document.getElementById('form-status').className.indexOf('error') >= 0",
+    8000,
+    '校验失败后应结束等待并显示错误状态',
+  );
+
+  // ---- 失败后恢复：可继续填写与增删；内容、规格顺序、属性顺序与提交时一致；错误只在原第三条 ----
+  const unlocked = await page.eval(LOCK_STATE_EXPR);
+  assert.equal(unlocked.submitDisabled, false, '失败响应后提交入口恢复可用');
+  assert.equal(unlocked.addSpecDisabled, false);
+  assert.equal(unlocked.allInputsDisabled, false, '失败响应后所有输入框恢复可编辑');
+  assert.equal(unlocked.allButtonsDisabled, false);
+  assert.equal(unlocked.statusClass, 'error', '恢复后展示的是校验失败而不是保存中状态');
+
+  const state = await page.eval(FORM_STATE_EXPR);
+  assert.equal(state.productName, '  锁定测试商品  ', '商品名称原文（含首尾空白）保留');
+  assert.deepEqual(state.numbers, ['规格 1', '规格 2', '规格 3'], '等待期间被尝试删除的规格仍在，编号不变');
+  assert.deepEqual(state.cards.map((c: any) => [c.attrs.map((a: any) => [a.name, a.value]), c.price, c.stock]), [
+    [[['尺码', 'M']], '10.00', '5'],
+    [[['颜色', '蓝色']], '20.00', '0'],
+    [[['颜色', '绿色']], '1.2.3', '7'],
+  ], '返回后表单内容必须与本次发送的内容一致：零库存、不合规售价原样保留');
+  assert.equal(state.cards[0].priceInvalid, false, '合法售价不能被连带标错');
+  assert.equal(state.cards[0].stockInvalid, false);
+  assert.equal(state.cards[1].stock, '0', '零库存原样保留');
+  assert.equal(state.cards[1].priceInvalid, false);
+  assert.equal(state.cards[2].price, '1.2.3', '不合规售价原文保留');
+  assert.equal(state.cards[2].priceInvalid, true, '错误必须对应实际提交的第三条规格，而不是等待期间被尝试删除后的错位规格');
+  assert.match(state.cards[2].priceErr, /售价/);
+  assert.deepEqual(await getProducts(server.url), [], '校验失败不产生记录，已有商品列表不变');
+
+  // 恢复操作后，删除最后一条规格、最后一个属性的限制仍与原来一致。
+  const limits = await page.eval(`(function () {
+    var cards = document.querySelectorAll('#specs [data-spec]');
+    cards[2].querySelector('.remove-spec').click();
+    cards = document.querySelectorAll('#specs [data-spec]');
+    cards[1].querySelector('.remove-spec').click();
+    cards = document.querySelectorAll('#specs [data-spec]');
+    cards[0].querySelector('.remove-spec').click(); // 最后一条规格不允许删除
+    var afterSpecs = document.querySelectorAll('#specs [data-spec]').length;
+    cards[0].querySelector('.remove-attr').click(); // 最后一个属性不允许删除
+    var afterAttrs = cards[0].querySelectorAll('.attr-row').length;
+    return { afterSpecs: afterSpecs, afterAttrs: afterAttrs };
+  })()`);
+  assert.deepEqual(limits, { afterSpecs: 1, afterAttrs: 1 }, '恢复后最后一条规格与最后一个属性仍不能删除');
+});
+
+test('网页：单条规格等待期间同样锁定；网络失败后恢复操作并保留内容，可再次提交成功', async (t) => {
+  if (!CHROME_BIN) { t.skip('未找到 Chrome/Chromium，跳过网页操作回归'); return; }
+
+  const server = await startServer();
+  t.after(() => stopServer(server));
+  const browser = await CdpBrowser.launch();
+  t.after(() => browser.close());
+
+  const page = await browser.newPage(`${server.url}/`);
+  await page.eval(`(function () {
+    document.querySelector('[data-name-input]').value = '网络失败商品';
+    var card = document.querySelector('#specs [data-spec]');
+    card.querySelector('[data-attr-name]').value = '颜色';
+    card.querySelector('[data-attr-value]').value = '红色';
+    card.querySelector('[data-price]').value = '10.00';
+    card.querySelector('[data-stock]').value = '2';
+  })()`);
+
+  const held = await submitAndHold(page);
+  assert.deepEqual(held.payload, {
+    name: '网络失败商品',
+    specs: [{ attributes: [{ name: '颜色', value: '红色' }], price: '10.00', stock: 2 }],
+  });
+
+  const lock = await page.eval(LOCK_STATE_EXPR);
+  assert.match(lock.statusText, /正在保存/, '单条规格等待期间也要显示正在保存');
+  assert.equal(lock.statusClass, 'saving');
+  assert.equal(lock.specCount, 1);
+  assert.equal(lock.totalInputCount, 5, '名称 + 属性名称/值 + 售价 + 库存');
+  assert.equal(lock.disabledInputCount, 5, '单条规格时所有输入框同样必须锁定');
+  assert.equal(lock.totalButtonCount, 5);
+  assert.equal(lock.disabledButtonCount, 5, '单条规格时所有按钮同样必须锁定');
+
+  // 等待期间增删操作无效（只有一条规格/一个属性时本来也不能删除，锁定后添加同样无效）。
+  await page.eval(`(function () {
+    document.getElementById('add-spec').click();
+    var card = document.querySelector('#specs [data-spec]');
+    card.querySelector('.add-attr').click();
+    card.querySelector('.remove-spec').click();
+    card.querySelector('.remove-attr').click();
+  })()`);
+  const stuck = await page.eval(LOCK_STATE_EXPR);
+  assert.equal(stuck.specCount, 1, '等待期间不能添加规格');
+  assert.equal(
+    await page.eval("document.querySelector('#specs [data-spec]').querySelectorAll('.attr-row').length"),
+    1,
+    '等待期间不能添加或删除属性',
+  );
+
+  // 模拟网络请求失败：拦截点直接失败该请求，fetch 进入 catch。
+  await page.send('Fetch.failRequest', { requestId: held.requestId, errorReason: 'Failed' });
+  await page.waitFor(
+    "document.getElementById('form-status').className.indexOf('error') >= 0",
+    8000,
+    '网络失败后应转入错误状态而不是一直等待',
+  );
+
+  const afterFail = await page.eval(LOCK_STATE_EXPR);
+  assert.equal(afterFail.submitDisabled, false, '网络失败后提交入口必须恢复，表单不能一直无法使用');
+  assert.equal(afterFail.allInputsDisabled, false, '网络失败后输入框恢复可编辑');
+  assert.equal(afterFail.allButtonsDisabled, false, '网络失败后增删按钮恢复可用');
+  assert.doesNotMatch(afterFail.statusText, /正在保存/, '网络失败后不能继续显示正在保存');
+  const kept = await page.eval(FORM_STATE_EXPR);
+  assert.match(kept.statusText, /保存失败/, '沿用现有保存失败提示');
+  assert.equal(kept.productName, '网络失败商品', '网络失败后填写内容完整保留');
+  assert.equal(kept.cards[0].attrs[0].name, '颜色');
+  assert.equal(kept.cards[0].attrs[0].value, '红色');
+  assert.equal(kept.cards[0].price, '10.00');
+  assert.equal(kept.cards[0].stock, '2');
+
+  // 恢复后最后一条规格与最后一个属性依旧不能删除。
+  assert.equal(
+    await page.eval(`(function () {
+      var card = document.querySelector('#specs [data-spec]');
+      card.querySelector('.remove-spec').click();
+      card.querySelector('.remove-attr').click();
+      return document.querySelectorAll('#specs [data-spec]').length * 10
+        + card.querySelectorAll('.attr-row').length;
+    })()`),
+    11,
+    '恢复后仍保留最后一条规格和最后一个属性',
+  );
+
+  // 直接再次提交：重新进入等待状态并成功，不能受上次失败影响。
+  const retry = await submitAndHold(page);
+  assert.deepEqual(retry.payload, held.payload, '保留的内容可直接再次提交');
+  const savingAgain = await page.eval(LOCK_STATE_EXPR);
+  assert.match(savingAgain.statusText, /正在保存/, '再次提交时重新进入等待状态');
+  assert.equal(savingAgain.statusClass, 'saving');
+  assert.equal(savingAgain.allInputsDisabled, true);
+  assert.equal(
+    await page.eval("document.querySelectorAll('#product-form .invalid').length"),
+    0,
+    '再次提交时上次失败的错误标记已清除',
+  );
+  await page.continueRequest(retry.requestId);
+
+  await page.waitFor(
+    "document.querySelector('[data-name-input]').value === '' && document.querySelectorAll('#product-list .product').length === 1",
+    8000,
+    '网络失败恢复后再次提交应成功并返回首页',
+  );
+  const list = await page.eval(LIST_STATE_EXPR);
+  assert.deepEqual(list.products, [{
+    name: '网络失败商品',
+    specs: [{ attrs: ['颜色：红色'], price: '¥10.00', stock: '库存 2', outOfStock: false }],
+  }]);
+  assert.equal((await getProducts(server.url)).length, 1, '失败的请求没有产生记录');
 });

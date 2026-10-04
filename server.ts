@@ -330,6 +330,8 @@ button:disabled{opacity:.6;cursor:wait}
 .err{color:#b4231a;font-size:.85rem;min-height:1em}
 #form-status{margin:.8rem 0;padding:.6rem .9rem;border-radius:.5rem;display:none}
 #form-status.error{display:block;background:#fde8e8;border:1px solid #f3b6b1;color:#8a1c14}
+#form-status.saving{display:block;background:#eaf1fb;border:1px solid #b8cbe8;color:#1c4d80}
+#product-form input:disabled{background:#f1f4f9;color:#374151}
 .field label{display:flex;gap:.5rem;align-items:center;flex-wrap:wrap}
 .form-actions{margin-top:.8rem;display:flex;gap:.8rem;align-items:center}
 `;
@@ -341,6 +343,8 @@ const PAGE_SCRIPT = `
   var specsBox = document.getElementById('specs');
   var statusBox = document.getElementById('form-status');
   var submitBtn = document.getElementById('submit-btn');
+  var addSpecBtn = document.getElementById('add-spec');
+  var submitting = false;
 
   function attrRowHtml() {
     return '<div class="attr-row">'
@@ -372,10 +376,12 @@ const PAGE_SCRIPT = `
     }
   }
   function addSpec() {
+    if (submitting) return;
     specsBox.insertAdjacentHTML('beforeend', specCardHtml());
     refreshNumbers();
   }
   specsBox.addEventListener('click', function (event) {
+    if (submitting) return; // 等待保存结果期间不允许添加或删除规格、属性
     var target = event.target;
     if (!(target instanceof Element)) return;
     if (target.classList.contains('add-attr')) {
@@ -440,6 +446,24 @@ const PAGE_SCRIPT = `
     statusBox.textContent = '保存失败，商品未保存，请稍后重试。已有商品没有受到影响，填写内容仍然保留。';
   }
 
+  // 等待保存结果期间：锁定所有输入与增删按钮，页面内容必须与本次发送的载荷保持一致。
+  function setFormLocked(locked) {
+    nameInput.disabled = locked;
+    addSpecBtn.disabled = locked;
+    var controls = specsBox.querySelectorAll('input, button');
+    for (var i = 0; i < controls.length; i++) controls[i].disabled = locked;
+  }
+  function setSaving() {
+    statusBox.className = 'saving';
+    statusBox.textContent = '正在保存……';
+  }
+  // 请求结束且未跳转时：结束等待状态，恢复填写与增删操作，填写内容原样保留。
+  function restoreForm() {
+    submitting = false;
+    submitBtn.disabled = false;
+    setFormLocked(false);
+  }
+
   function collectPayload() {
     var payload = { name: nameInput.value, specs: [] };
     var cards = specsBox.querySelectorAll('[data-spec]');
@@ -474,8 +498,12 @@ const PAGE_SCRIPT = `
   addSpec();
   form.addEventListener('submit', function (event) {
     event.preventDefault();
+    if (submitting) return; // 等待期间再次提交（含回车）直接忽略
+    submitting = true;
     clearErrors();
     submitBtn.disabled = true;
+    setFormLocked(true);
+    setSaving();
     fetch('/api/products', {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
@@ -485,18 +513,18 @@ const PAGE_SCRIPT = `
         return { status: response.status, data: data };
       });
     }).then(function (result) {
-      submitBtn.disabled = false;
       if (result.status === 201 && result.data) {
         window.location.assign('/');
-        return;
+        return; // 成功后整页跳转，保持等待状态直到离开
       }
+      restoreForm();
       if (result.status === 400 && result.data) {
         showFailure(result.data.error || '提交内容不符合要求', result.data.details);
       } else {
         showSaveError();
       }
     }).catch(function () {
-      submitBtn.disabled = false;
+      restoreForm();
       showSaveError();
     });
   });
