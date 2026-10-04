@@ -18,8 +18,8 @@ interface RunningServer {
   child: ChildProcess;
 }
 
-function startServer(): Promise<RunningServer> {
-  const dataDir = mkdtempSync(join(tmpdir(), 'cartwell-test-'));
+// 在指定的业务数据目录上启动服务；同一目录可在正常关闭后再次传入，模拟用户重新打开。
+function startServerInDir(dataDir: string): Promise<RunningServer> {
   const child = spawn(
     process.execPath,
     [SERVER_PATH, 'serve', '--host', '127.0.0.1', '--port', '0', '--data-dir', dataDir],
@@ -47,6 +47,11 @@ function startServer(): Promise<RunningServer> {
   });
 }
 
+function startServer(): Promise<RunningServer> {
+  const dataDir = mkdtempSync(join(tmpdir(), 'cartwell-test-'));
+  return startServerInDir(dataDir);
+}
+
 async function stopServer(server: RunningServer): Promise<void> {
   server.child.kill('SIGTERM');
   await Promise.race([
@@ -55,6 +60,17 @@ async function stopServer(server: RunningServer): Promise<void> {
   ]);
   if (server.child.exitCode === null) server.child.kill('SIGKILL');
   rmSync(server.dataDir, { recursive: true, force: true });
+}
+
+// 正常关闭服务：发送 SIGTERM 并等待进程以退出码 0 结束，但保留业务数据目录，
+// 以便随后用同一目录重新启动，验证「关闭后再读取」而不是「服务一直运行」的结果。
+async function shutdownServerKeepingData(server: RunningServer): Promise<void> {
+  server.child.kill('SIGTERM');
+  const exitCode = await Promise.race<number | null>([
+    once(server.child, 'exit').then((args) => args[0] as number | null),
+    new Promise<null>((resolve) => setTimeout(() => resolve(null), 5000)),
+  ]);
+  assert.equal(exitCode, 0, '服务应响应 SIGTERM 正常关闭，并以退出码 0 退出');
 }
 
 interface ApiResult {
@@ -2221,4 +2237,333 @@ test('网页：保存失败时停留在表单、保留全部输入并提示未�
   ], '接口保存的内容与页面展示一致，各规格库存与属性正确对应');
   assert.deepEqual(products[1], listBefore[0], '已有商品的规格、售价和库存始终保持原样');
   assert.equal(products[1].id, existing.body.id);
+});
+
+// ---------- 正常关闭后用同一业务数据目录重新打开：持久化回归 ----------
+//
+// 以上用例都在同一个服务进程存活期间查询列表；本部分真正发送 SIGTERM 等待服务正常退出，
+// 再用同一个 --data-dir 启动新进程，覆盖「保存成功 → 正常关闭 → 重新打开读取」的完整路径，
+// 不能用「服务一直运行时能查到商品」代替关闭前后实际结果的保障。
+
+async function getHomeHtml(url: string): Promise<string> {
+  const response = await fetch(`${url}/`);
+  assert.equal(response.status, 200);
+  return response.text();
+}
+
+function decodeHtml(text: string): string {
+  return text
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'")
+    .replace(/&amp;/g, '&'); // &amp; 最后还原，避免把已转义的实体二次解码
+}
+
+// 从首页 HTML 解析商品展示：商品先后顺序、名称，以及每条规格的属性（保持规格与属性内排列
+// 顺序）、售价、库存文本和缺货标记，用于与接口记录逐条对应。
+function parseHomeProducts(html: string): Array<{
+  name: string;
+  specs: Array<{ attrs: string[]; price: string; stock: string; outOfStock: boolean }>;
+}> {
+  return html.split('<li class="product">').slice(1).map((block) => {
+    const name = decodeHtml(block.split('</h3>')[0]!.split('<h3>')[1]!);
+    const specs = block.split('<li class="spec-row">').slice(1).map((rowChunk) => {
+      const row = rowChunk.split('</li>')[0]!;
+      return {
+        attrs: row
+          .split('<span class="attr">')
+          .slice(1)
+          .map((part) => decodeHtml(part.split('</span>')[0]!)),
+        price: decodeHtml(row.split('<span class="price">')[1]!.split('</span>')[0]!),
+        stock: decodeHtml(row.split('<span class="stock">')[1]!.split('</span>')[0]!),
+        outOfStock: row.includes('badge-oos'),
+      };
+    });
+    return { name, specs };
+  });
+}
+
+// 接口记录在首页上应有的展示形态。
+function expectedHomeView(products: any[]): ReturnType<typeof parseHomeProducts> {
+  return products.map((product) => ({
+    name: product.name,
+    specs: product.specs.map((specItem: any) => ({
+      attrs: specItem.attributes.map((attribute: any) => `${attribute.name}：${attribute.value}`),
+      price: `¥${specItem.price}`,
+      stock: `库存 ${specItem.stock}`,
+      outOfStock: specItem.stock === 0,
+    })),
+  }));
+}
+
+test('全新空目录正常关闭后用同一目录重新打开：products 仍为空数组，首页保留空列表提示且不自动添加示例商品', async (t) => {
+  const dataDir = mkdtempSync(join(tmpdir(), 'cartwell-reopen-'));
+  let server: RunningServer | undefined;
+  t.after(async () => {
+    if (server) await stopServer(server);
+    else rmSync(dataDir, { recursive: true, force: true });
+  });
+
+  server = await startServerInDir(dataDir);
+  assert.deepEqual(await getProducts(server.url), [], '全新目录首次打开应返回空 products 数组');
+  let html = await getHomeHtml(server.url);
+  assert.match(html, /id="empty-tip"/, '空目录首页应显示现有的空列表提示');
+  assert.match(html, /还没有商品记录/);
+  assert.doesNotMatch(html, /id="product-list"/, '空目录不应渲染商品列表');
+
+  await shutdownServerKeepingData(server);
+  server = undefined;
+
+  // 关闭后、重新打开前直接检查磁盘：只有空列表数据，没有预置示例商品
+  assert.equal(readFileSync(join(dataDir, 'products.json'), 'utf8'), '[]\n');
+
+  server = await startServerInDir(dataDir);
+  assert.deepEqual(await getProducts(server.url), [], '重新打开后仍必须返回空 products 数组');
+  html = await getHomeHtml(server.url);
+  assert.match(html, /id="empty-tip"/, '重新打开后首页仍应显示现有空列表提示');
+  assert.match(html, /还没有商品记录/);
+  assert.doesNotMatch(html, /id="product-list"/, '重新打开不能自动补出任何示例商品');
+});
+
+test('多件商品正常关闭后重新打开：products 数组数量与顺序不变，标识、时间、名称、规格、属性、金额、库存逐项保留', async (t) => {
+  const dataDir = mkdtempSync(join(tmpdir(), 'cartwell-reopen-'));
+  let server: RunningServer | undefined;
+  t.after(async () => {
+    if (server) await stopServer(server);
+    else rmSync(dataDir, { recursive: true, force: true });
+  });
+
+  server = await startServerInDir(dataDir);
+
+  // 两件名称、规格属性组合完全相同的商品：名称与属性名带首尾空白且含尖括号，
+  // 关闭重开后仍必须是各自独立的两条记录，不能合并。
+  const duplicatePayload = productPayload('  同款<T恤>  ', [
+    spec([[' 颜色<b> ', '红色'], ['尺码', 'M']], '12.50', 20),
+  ]);
+  const first = await postProduct(server.url, duplicatePayload);
+  assert.equal(first.status, 201);
+  const second = await postProduct(server.url, duplicatePayload);
+  assert.equal(second.status, 201);
+  assert.notEqual(first.body.id, second.body.id, '两件相同商品必须各自获得独立标识');
+
+  // 一件同时含四条规格的商品：普通售价/库存、零售价+零库存、超出安全整数范围的金额、
+  // 库存安全整数上限并存；各规格售价与库存不同，第三条规格属性排列顺序刻意与其他规格相反。
+  const bigPrice = '9007199254740993.01';
+  const third = await postProduct(server.url, productPayload('尖括号商品<a>', [
+    spec([['颜色', '红<i>'], ['尺码', 'M']], '12.50', 20),
+    spec([['颜色', '红<i>'], ['尺码', 'L']], '0', 0),
+    spec([['尺码', 'X'], ['颜色', '蓝>']], bigPrice, 1),
+    spec([['颜色', '红<i>'], ['尺码', 'S']], '7.5', 9007199254740991),
+  ]));
+  assert.equal(third.status, 201);
+
+  const created = [third.body, second.body, first.body];
+  const beforeClose = await getProducts(server.url);
+  assert.deepEqual(beforeClose, created);
+  const homeBefore = parseHomeProducts(await getHomeHtml(server.url));
+  assert.deepEqual(homeBefore, expectedHomeView(created));
+
+  await shutdownServerKeepingData(server);
+  server = undefined;
+
+  // 关闭后、重新打开前直接检查磁盘文件：数据在新进程启动之前就已完整落盘
+  const storedText = readFileSync(join(dataDir, 'products.json'), 'utf8');
+  assert.deepEqual(JSON.parse(storedText), created, '磁盘上的记录与关闭前的接口结果逐项一致');
+  // 磁盘文件以缩进格式写入，冒号后带空格；以下匹配兼容该空白。
+  assert.match(storedText, /"price":\s*"9007199254740993\.01"/, '超大金额必须按字符串逐位落盘');
+  assert.match(storedText, /"price":\s*"12\.50"/, '12.50 必须保持两位小数字符串落盘');
+  assert.doesNotMatch(storedText, /"price":\s*\d/, '落盘金额不能是 JSON 数字');
+
+  server = await startServerInDir(dataDir);
+
+  // ---- 重新打开后的列表接口：仍以 products 数组返回，数量与先后顺序不变 ----
+  const listResponse = await fetch(`${server.url}/api/products`);
+  assert.equal(listResponse.status, 200);
+  const listText = await listResponse.text();
+  const reopened = JSON.parse(listText).products;
+  assert.ok(Array.isArray(reopened), '重新打开后仍必须以 products 数组返回记录');
+  assert.equal(reopened.length, 3);
+  assert.deepEqual(
+    reopened.map((product: any) => product.id),
+    [third.body.id, second.body.id, first.body.id],
+    '数量与先后顺序不变，最近创建的商品仍排在最前',
+  );
+  assert.deepEqual(reopened, created, '关闭前创建响应中的完整记录在重新打开后逐项一致');
+  assert.deepEqual(reopened, beforeClose, '重新打开的列表与关闭前查询结果完全一致');
+
+  // 每件商品原来的标识和创建时间保持不变
+  for (const [index, record] of created.entries()) {
+    assert.equal(reopened[index].id, record.id, `第 ${index + 1} 条商品的标识必须保持不变`);
+    assert.equal(reopened[index].createdAt, record.createdAt, `第 ${index + 1} 条商品的创建时间必须保持不变`);
+    assert.ok(!Number.isNaN(Date.parse(reopened[index].createdAt)));
+  }
+
+  // 名称与规格属性组合完全相同的两件商品仍是独立记录
+  const twins = reopened.filter((product: any) => product.name === '同款<T恤>');
+  assert.equal(twins.length, 2, '同名同规格的两件商品不能在重新读取时合并');
+  assert.notEqual(twins[0].id, twins[1].id);
+  assert.deepEqual(twins[0].specs, twins[1].specs);
+
+  const multi = reopened[0];
+  // 名称、规格及属性的内容和排列顺序保留：第三条规格的尺码属性仍排在颜色之前
+  assert.deepEqual(
+    multi.specs.map((specItem: any) => specItem.attributes.map((attribute: any) => [attribute.name, attribute.value])),
+    [
+      [['颜色', '红<i>'], ['尺码', 'M']],
+      [['颜色', '红<i>'], ['尺码', 'L']],
+      [['尺码', 'X'], ['颜色', '蓝>']],
+      [['颜色', '红<i>'], ['尺码', 'S']],
+    ],
+  );
+  assert.deepEqual(multi.specs[2].attributes.map((attribute: any) => attribute.name), ['尺码', '颜色']);
+
+  // 售价和库存各不相同：重新读取后每个金额与库存仍对应原来的属性组合
+  assert.deepEqual(
+    multi.specs.map((specItem: any) => [specItem.price, specItem.stock]),
+    [
+      ['12.50', 20], // 普通售价 + 普通库存
+      ['0.00', 0], // 零售价为零 + 零库存同时保留
+      ['9007199254740993.01', 1], // 超出安全整数范围的金额逐位保留
+      ['7.50', 9007199254740991], // 一位小数补全为两位；安全整数上限库存不丢位
+    ],
+  );
+
+  // 新增时已经去掉的名称和属性首尾空白，重新打开后不应再次出现
+  for (const product of reopened) {
+    assert.equal(product.name, product.name.trim(), '商品名称不能重新带回首尾空白');
+    for (const specItem of product.specs) {
+      for (const attribute of specItem.attributes) {
+        assert.equal(attribute.name, attribute.name.trim(), '属性名称不能重新带回首尾空白');
+        assert.equal(attribute.value, attribute.value.trim(), '属性值不能重新带回首尾空白');
+      }
+    }
+  }
+  assert.equal(twins[0].name, '同款<T恤>');
+  assert.equal(twins[0].specs[0].attributes[0].name, '颜色<b>');
+  assert.equal(twins[0].specs[0].attributes[0].value, '红色');
+
+  // 售价在接口原文中继续以两位小数字符串返回：12.50 不能变数字或 12.5；超大金额逐位保留、无指数
+  assert.match(listText, /"price":"12\.50"/, '12.50 重新打开后仍是两位小数字符串');
+  assert.doesNotMatch(listText, /"price":12\.5/, '12.50 不能变成 JSON 数字 12.5');
+  assert.doesNotMatch(listText, /"price":"12\.5"/, '不能丢掉末尾补全的零');
+  assert.match(
+    listText,
+    new RegExp(`"price":"${bigPrice.replace(/\./g, '\\.')}"`),
+    '9007199254740993.01 必须逐位保留，不能丢失末尾数字',
+  );
+  assert.doesNotMatch(listText, /"price":\d/, '任何售价都不能以 JSON 数字返回');
+  assert.doesNotMatch(listText, /9007199254740993(?:\.\d+)?[eE]/, '超大金额不能变成指数写法');
+
+  // ---- 重新打开后的首页：名称、规格明细和排列次序与接口记录对应；尖括号按普通文字显示 ----
+  const html = await getHomeHtml(server.url);
+  assert.doesNotMatch(html, /id="empty-tip"/, '已有商品时不再显示空列表提示');
+  const homeAfter = parseHomeProducts(html);
+  assert.deepEqual(homeAfter, homeBefore, '重新打开后的首页展示与关闭前完全一致');
+  assert.deepEqual(homeAfter, expectedHomeView(reopened), '首页商品名称、规格明细与排列次序与接口记录一一对应');
+
+  assert.deepEqual(
+    homeAfter[0].specs.map((specItem) => [specItem.price, specItem.stock, specItem.outOfStock]),
+    [
+      ['¥12.50', '库存 20', false],
+      ['¥0.00', '库存 0', true],
+      ['¥9007199254740993.01', '库存 1', false],
+      ['¥7.50', '库存 9007199254740991', false],
+    ],
+    '零库存规格在首页继续标记缺货，其他有库存规格不能被连带标记',
+  );
+  assert.equal(html.match(/badge badge-oos/g)?.length ?? 0, 1, '全页只有零库存规格一条缺货标记');
+
+  // 名称和属性里的尖括号等字符在首页按普通文字显示（转义后的文本可见，原始标签不存在）
+  assert.match(html, /尖括号商品&lt;a&gt;/);
+  assert.match(html, /同款&lt;T恤&gt;/);
+  assert.match(html, /颜色&lt;b&gt;：红色/);
+  assert.match(html, /红&lt;i&gt;/);
+  assert.match(html, /蓝&gt;/);
+  assert.doesNotMatch(html, /尖括号商品<a>/, '名称中的尖括号不能被当成真实标签');
+  assert.doesNotMatch(html, /<T恤>/);
+});
+
+test('关闭前因一条规格售价不合规被整件拒绝的商品，重新打开后仍不出现；此前商品完整可见且目录可继续保存', async (t) => {
+  const dataDir = mkdtempSync(join(tmpdir(), 'cartwell-reopen-'));
+  let server: RunningServer | undefined;
+  t.after(async () => {
+    if (server) await stopServer(server);
+    else rmSync(dataDir, { recursive: true, force: true });
+  });
+
+  server = await startServerInDir(dataDir);
+
+  // 先成功保存一件含零库存规格的商品
+  const existing = await postProduct(server.url, productPayload('已有商品', [
+    spec([['颜色', '黑色'], ['尺码', 'S']], '59.00', 12),
+    spec([['颜色', '黑色'], ['尺码', 'M']], '69.5', 0),
+  ]));
+  assert.equal(existing.status, 201);
+
+  // 一条合法规格 + 一条售价超过两位小数的规格：整件商品必须被拒绝
+  const rejected = await postProduct(server.url, productPayload('整件拒绝商品', [
+    spec([['颜色', '蓝色']], '30.00', 4),
+    spec([['颜色', '红色'], ['尺码', 'M']], '12.345', 7),
+  ]));
+  assert.equal(rejected.status, 400);
+  assert.ok(
+    rejected.body.details.some((detail: any) => detail.field === 'price' && detail.specIndex === 1),
+    '拒绝原因必须指出第 2 条规格的售价字段',
+  );
+
+  const beforeClose = await getProducts(server.url);
+  assert.deepEqual(beforeClose, [existing.body], '拒绝新增不能影响此前成功保存的商品');
+  assert.ok(!JSON.stringify(beforeClose).includes('整件拒绝商品'));
+  assert.ok(!JSON.stringify(beforeClose).includes('蓝色'), '被拒商品中原本合法的规格也不能残留');
+
+  await shutdownServerKeepingData(server);
+  server = undefined;
+
+  // ---- 用同一目录重新打开 ----
+  server = await startServerInDir(dataDir);
+  const reopened = await getProducts(server.url);
+  assert.deepEqual(reopened, beforeClose, '重新打开后此前成功保存的商品完整可见');
+  assert.deepEqual(reopened, [existing.body]);
+  assert.equal(reopened[0].id, existing.body.id, '标识保持不变');
+  assert.equal(reopened[0].createdAt, existing.body.createdAt, '创建时间保持不变');
+  assert.deepEqual(
+    reopened[0].specs.map((specItem: any) => [specItem.price, specItem.stock]),
+    [['59.00', 12], ['69.50', 0]],
+    '普通规格与零库存规格、金额与库存的对应关系保持原样',
+  );
+  assert.ok(!JSON.stringify(reopened).includes('整件拒绝商品'), '被拒绝的商品不能在重新读取后出现');
+  assert.ok(!JSON.stringify(reopened).includes('蓝色'), '其中原本合法的规格同样不能在重新读取后出现');
+
+  const html = await getHomeHtml(server.url);
+  assert.doesNotMatch(html, /id="empty-tip"/, '已有商品的目录不显示空列表提示');
+  assert.doesNotMatch(html, /整件拒绝商品|蓝色/);
+  assert.deepEqual(
+    parseHomeProducts(html),
+    expectedHomeView(reopened),
+    '首页与接口一致：已有商品完整保留，零库存规格仍标记缺货',
+  );
+
+  // 重新打开后的目录仍可正常新增
+  const another = await postProduct(server.url, productPayload('重开后新增商品', [
+    spec([['颜色', '白色']], '39.90', 3),
+  ]));
+  assert.equal(another.status, 201);
+  assert.deepEqual(
+    (await getProducts(server.url)).map((product: any) => product.id),
+    [another.body.id, existing.body.id],
+  );
+
+  // 再正常关闭、再次用同一目录打开：经历过拒绝与多次重开后，成功保存的记录仍在且顺序不变
+  await shutdownServerKeepingData(server);
+  server = undefined;
+  server = await startServerInDir(dataDir);
+  const secondReopen = await getProducts(server.url);
+  assert.deepEqual(
+    secondReopen.map((product: any) => product.id),
+    [another.body.id, existing.body.id],
+    '第二次重新打开后记录数量与先后顺序仍保持不变',
+  );
+  assert.deepEqual(secondReopen[1], existing.body, '更早保存的商品记录仍完整无缺');
+  assert.ok(!JSON.stringify(secondReopen).includes('整件拒绝商品'));
 });
