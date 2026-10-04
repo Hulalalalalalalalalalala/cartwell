@@ -537,3 +537,214 @@ test('处理超限请求后已有商品、售价和库存保持原样，且仍�
   assert.equal(finalList[0].id, another.body.id, '新商品排在列表最前');
   assert.deepEqual(finalList[1], before[0], '此前的商品记录完整保留');
 });
+
+// ---------- 售价校验与金额规范化回归 ----------
+
+function priceErrors(details: any[]): any[] {
+  return details.filter((detail) => detail.field === 'price');
+}
+
+test('合法售价规范化为两位小数字符串：零、整数、一位/两位小数和前导零都按字符串处理', async (t) => {
+  const server = await startServer();
+  t.after(() => stopServer(server));
+
+  const cases = [
+    { label: '零', raw: '0', expected: '0.00' },
+    { label: '整数', raw: '12', expected: '12.00' },
+    { label: '一位小数', raw: '12.5', expected: '12.50' },
+    { label: '已有两位小数', raw: '12.50', expected: '12.50' },
+    { label: '多个前导零', raw: '00012.30', expected: '12.30' },
+  ];
+
+  const result = await postProduct(server.url, productPayload('金额规范化商品',
+    cases.map((item) => spec([['款型', item.label]], item.raw, 3)),
+  ));
+  assert.equal(result.status, 201);
+  assert.equal(result.body.specs.length, cases.length);
+
+  cases.forEach((item, index) => {
+    const price = result.body.specs[index].price;
+    assert.equal(typeof price, 'string', `「${item.raw}」规范化后售价仍是字符串`);
+    assert.equal(price, item.expected, `「${item.raw}」应保存为「${item.expected}」`);
+    assert.match(price, /^\d+\.\d{2}$/, '金额必须恰好两位小数、不带指数或多余小数');
+  });
+
+  const products = await getProducts(server.url);
+  assert.equal(products.length, 1);
+  assert.deepEqual(products[0], result.body, '列表记录应与创建响应完全一致，含规范化后的金额');
+});
+
+test('同一商品不同规格使用不同合法金额时，规范化结果各自对应原属性组合，不互相覆盖或交换', async (t) => {
+  const server = await startServer();
+  t.after(() => stopServer(server));
+
+  const result = await postProduct(server.url, productPayload('多规格金额商品', [
+    spec([['颜色', '红']], '0', 1),
+    spec([['颜色', '绿']], '8.5', 2),
+    spec([['颜色', '蓝']], '99.00', 3),
+    spec([['颜色', '白']], '00012.30', 4),
+  ]));
+  assert.equal(result.status, 201);
+
+  // 规格顺序保持，金额与属性组合、库存一一对应
+  assert.deepEqual(
+    result.body.specs.map((specRecord: any) => [specRecord.attributes[0].value, specRecord.price, specRecord.stock]),
+    [['红', '0.00', 1], ['绿', '8.50', 2], ['蓝', '99.00', 3], ['白', '12.30', 4]],
+  );
+
+  const products = await getProducts(server.url);
+  assert.deepEqual(
+    products[0].specs.map((specRecord: any) => [specRecord.attributes[0].value, specRecord.price, specRecord.stock]),
+    [['红', '0.00', 1], ['绿', '8.50', 2], ['蓝', '99.00', 3], ['白', '12.30', 4]],
+    '查询到的规格金额也必须对应原属性组合，不能串行或互换',
+  );
+});
+
+test('整数部分超过 JavaScript 安全整数范围的两位小数金额，在创建响应和列表查询中逐位保留', async (t) => {
+  const server = await startServer();
+  t.after(() => stopServer(server));
+
+  const bigPrices = ['9007199254740993.01', '9007199254740993.02'];
+  assert.ok(!Number.isSafeInteger(Number(bigPrices[0].split('.')[0])), '测试前提：整数部分超出安全整数范围');
+
+  const result = await postProduct(server.url, productPayload('大额商品', [
+    spec([['款型', '标准']], bigPrices[0], 9),
+    spec([['款型', '加价']], bigPrices[1], 1),
+  ]));
+  assert.equal(result.status, 201, '超出安全整数范围的合法金额应创建成功');
+
+  bigPrices.forEach((expected, index) => {
+    const price = result.body.specs[index].price;
+    assert.equal(typeof price, 'string', '售价必须是字符串，不能被解析成数字');
+    assert.equal(price, expected, '每一位数字都必须保留，不能丢位');
+    assert.doesNotMatch(price, /[eE]/, '不能变成指数形式');
+    assert.match(price, /^\d{16}\.\d{2}$/, '不能多出或缺少小数位');
+  });
+
+  // 在线路原文上也要逐位出现该字符串，排除任何数字转换
+  const rawList = await (await fetch(`${server.url}/api/products`)).text();
+  for (const expected of bigPrices) {
+    assert.ok(rawList.includes(`"price":"${expected}"`), `查询响应原文应逐位包含 ${expected}`);
+  }
+
+  const products = await getProducts(server.url);
+  assert.equal(products.length, 1);
+  assert.deepEqual(products[0].specs, result.body.specs, '列表中的大额金额与创建结果一致');
+});
+
+test('不合规售价返回 400，details 明确指出出错的规格位置与 price 字段，商品不被创建', async (t) => {
+  const server = await startServer();
+  t.after(() => stopServer(server));
+
+  // 商品名称、属性、库存和请求体大小都合规，仅售价不合规
+  const cases: Array<{ label: string; price: unknown }> = [
+    { label: '负数', price: '-12' },
+    { label: '负数零头', price: '-0.01' },
+    { label: '指数写法（小写）', price: '1e3' },
+    { label: '指数写法（大写）', price: '1E3' },
+    { label: '千位分隔符', price: '1,000.00' },
+    { label: '超过两位小数', price: '12.345' },
+    { label: '售价作为 JSON 数字（整数）', price: 12 },
+    { label: '售价作为 JSON 数字（小数）', price: 12.5 },
+    { label: '售价作为 JSON 数字（零）', price: 0 },
+    { label: '空字符串', price: '' },
+    { label: '空值 null', price: null },
+  ];
+
+  for (const item of cases) {
+    const result = await postProduct(server.url, productPayload('非法售价商品', [
+      spec([['颜色', '红色']], item.price as string, 5),
+    ]));
+    assert.equal(result.status, 400, `「${item.label}」应被拒绝`);
+    assert.equal(result.body.error, '商品校验未通过，未创建任何记录');
+    const errors = priceErrors(result.body.details);
+    assert.equal(errors.length, 1, `「${item.label}」应恰有一条售价错误`);
+    assert.equal(errors[0].field, 'price', '错误应指明是售价字段');
+    assert.equal(errors[0].specIndex, 0, '错误应指明出错的规格');
+    assert.equal(errors[0].path, 'specs[0].price');
+    assert.match(errors[0].message, /售价|金额/);
+    assert.notEqual(errors[0].message, '');
+  }
+
+  assert.deepEqual(await getProducts(server.url), [], '所有非法售价提交都不能留下商品记录');
+});
+
+test('售价 "12.345" 不会通过四舍五入、截断或默认值变成可保存金额', async (t) => {
+  const server = await startServer();
+  t.after(() => stopServer(server));
+
+  const result = await postProduct(server.url, productPayload('三位小数商品', [
+    spec([['颜色', '红色']], '12.345', 5),
+  ]));
+  assert.equal(result.status, 400);
+  const errors = priceErrors(result.body.details);
+  assert.equal(errors.length, 1);
+  assert.equal(errors[0].path, 'specs[0].price');
+
+  const products = await getProducts(server.url);
+  assert.deepEqual(products, [], '三位小数不能被保存');
+  const serialized = JSON.stringify(products);
+  for (const approximated of ['12.35', '12.34']) {
+    assert.ok(!serialized.includes(approximated), `不能把 12.345 近似保存成 ${approximated}`);
+  }
+  assert.ok(!serialized.includes('"0.00"'), '不能套用默认零金额保存');
+});
+
+test('多条规格同时有不合规售价时，details 分别指出每条需要修正的规格位置', async (t) => {
+  const server = await startServer();
+  t.after(() => stopServer(server));
+
+  const prices: unknown[] = ['-9', '10.00', '1e3', 5, ''];
+  const result = await postProduct(server.url, productPayload('多规格非法售价商品',
+    prices.map((price, index) => spec([['颜色', `颜色${index}`]], price as string, 6)),
+  ));
+
+  assert.equal(result.status, 400);
+  const errors = priceErrors(result.body.details);
+  assert.equal(result.body.details.length, 4, '其他字段均合规，应只有四条售价错误');
+  assert.deepEqual(
+    errors.map((detail) => detail.specIndex),
+    [0, 2, 3, 4],
+    '每条不合规售价的规格下标都应被指出，合法规格不在其中',
+  );
+  assert.deepEqual(
+    errors.map((detail) => detail.path),
+    ['specs[0].price', 'specs[2].price', 'specs[3].price', 'specs[4].price'],
+  );
+  assert.ok(errors.every((detail) => detail.field === 'price' && detail.message !== ''));
+
+  assert.deepEqual(await getProducts(server.url), [], '被拒绝的商品不能留下记录');
+});
+
+test('同一商品混有合法与非法售价规格时整个商品都不创建，已有商品的完整记录、售价和库存保持原样', async (t) => {
+  const server = await startServer();
+  t.after(() => stopServer(server));
+
+  const existing = await postProduct(server.url, productPayload('已有商品', [
+    spec([['颜色', '黑色'], ['尺码', 'S']], '59.00', 12),
+    spec([['颜色', '黑色'], ['尺码', 'M']], '69.5', 0),
+  ]));
+  assert.equal(existing.status, 201);
+  const before = await getProducts(server.url);
+  assert.equal(before.length, 1);
+
+  const rejected = await postProduct(server.url, productPayload('新商品', [
+    spec([['颜色', '蓝色']], '30.00', 4), // 售价合法的规格也不能单独留下
+    spec([['颜色', '绿色']], '-1', 9),
+    spec([['颜色', '白色']], '12.345', 2),
+  ]));
+  assert.equal(rejected.status, 400);
+  assert.deepEqual(
+    priceErrors(rejected.body.details).map((detail) => detail.specIndex).sort(),
+    [1, 2],
+    '错误详情只指向售价不合规的规格',
+  );
+
+  const after = await getProducts(server.url);
+  assert.deepEqual(after, before, '已有商品的完整记录、售价和库存应保持原样');
+  assert.ok(
+    after.every((product) => product.name !== '新商品'),
+    '整个商品（包括其中售价合法的规格）都不能被创建',
+  );
+  assert.ok(!JSON.stringify(after).includes('蓝色'), '合法规格不能单独留下');
+});
