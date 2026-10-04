@@ -6,6 +6,6 @@
   "scripts": {
     "start": "node server.ts serve",
     "help": "node server.ts --help",
-    "test": "node --test server.test.ts"
+    "test": "node --test server.test.ts page.test.ts"
   }
 }
