@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn, spawnSync, type ChildProcess } from 'node:child_process';
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { once } from 'node:events';
@@ -1119,7 +1119,8 @@ class CdpBrowser {
       new Promise((resolve) => setTimeout(resolve, 3000)),
     ]);
     if (this.child.exitCode === null) this.child.kill('SIGKILL');
-    rmSync(this.profileDir, { recursive: true, force: true });
+    // Chrome 退出后仍可能有迟到的配置文件写入，重试几次避免清理竞态误报
+    rmSync(this.profileDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
   }
 }
 
@@ -1977,6 +1978,247 @@ test('网页：库存文本输入不被改写成合法整数；失败后保留�
     { attributes: [{ name: '颜色', value: '蓝色' }], price: '10.00', stock: 9007199254740991 },
     { attributes: [{ name: '颜色', value: '紫色' }], price: '10.00', stock: 0 },
   ], '接口保存的库存与页面展示一致：数字类型、原数值，并与原属性组合对应');
+  assert.deepEqual(products[1], listBefore[0], '已有商品的规格、售价和库存始终保持原样');
+  assert.equal(products[1].id, existing.body.id);
+});
+
+// ---------- 服务器保存失败回归：500、不产生部分记录、已有商品不受影响、恢复后可再保存 ----------
+//
+// 通过把数据目录下的临时文件路径（products.json.tmp）变成目录，让保存时的写临时文件
+// 必然失败（EISDIR，对 root 运行同样有效），从而观察真实的服务器保存失败；删除该目录
+// 即恢复保存能力。读取已有数据不经过该路径，因此失败期间列表接口与首页不受影响。
+
+function blockSaving(dataDir: string): void {
+  mkdirSync(join(dataDir, 'products.json.tmp'));
+}
+
+function restoreSaving(dataDir: string): void {
+  rmSync(join(dataDir, 'products.json.tmp'), { recursive: true, force: true });
+}
+
+test('接口：合法商品遇到保存失败返回 500 且不产生记录，已有商品原样保留，恢复后同一请求保存成功', async (t) => {
+  const server = await startServer();
+  t.after(() => stopServer(server));
+
+  // 先成功保存两件商品作为「已有记录」
+  const first = await postProduct(server.url, productPayload('基础T恤', [
+    spec([['颜色', '红色'], ['尺码', 'M']], '99.00', 20),
+    spec([['颜色', '红色'], ['尺码', 'L']], '99.50', 0),
+  ]));
+  assert.equal(first.status, 201);
+  const second = await postProduct(server.url, productPayload('帆布帽', [
+    spec([['颜色', '卡其']], '45.00', 8),
+  ]));
+  assert.equal(second.status, 201);
+
+  const before = await getProducts(server.url);
+  assert.equal(before.length, 2);
+  const dataFileBefore = readFileSync(join(server.dataDir, 'products.json'), 'utf8');
+
+  blockSaving(server.dataDir);
+  t.after(() => restoreSaving(server.dataDir));
+
+  // 内容完全合法但尚未规范化：名称与属性带首尾空白，售价 '88'、'88.5' 不是两位小数。
+  // 三条规格属性组合各不相同，售价、库存各异。
+  const payload = productPayload('  陶瓷马克杯  ', [
+    spec([[' 颜色 ', ' 米白 '], ['容量', '350ml']], '88', 15),
+    spec([['颜色', '米白'], ['容量', '500ml']], '88.5', 0),
+    spec([['颜色', '湖蓝'], ['容量', '350ml']], '92.50', 7),
+  ]);
+
+  const failed = await postProduct(server.url, payload);
+  assert.equal(failed.status, 500, '保存过程失败应返回 500，而不是字段不合规的 400');
+  assert.equal(typeof failed.body.error, 'string');
+  assert.match(failed.body.error, /保存失败/, '错误说明应明确是保存失败');
+  assert.equal(failed.body.id, undefined, '不能返回创建成功的商品记录');
+  assert.equal(failed.body.name, undefined);
+  assert.equal(failed.body.specs, undefined);
+  assert.equal(failed.body.createdAt, undefined);
+  assert.equal(failed.body.details, undefined, '保存失败不能误报成具体字段不合规');
+
+  // 连续再试一次：仍返回 500，且不会因此累积出部分记录
+  const retried = await postProduct(server.url, payload);
+  assert.equal(retried.status, 500);
+
+  // 失败期间列表接口照常工作，已有商品的名称、属性、售价、库存、标识、创建时间与顺序全部保持原值
+  const during = await getProducts(server.url);
+  assert.deepEqual(during, before, '保存失败不能改动已有商品，也不能留下整件或部分规格的新记录');
+  assert.ok(
+    during.every((product) => !product.name.includes('陶瓷马克杯')),
+    '被拒的新商品不能出现在列表中',
+  );
+  assert.equal(
+    readFileSync(join(server.dataDir, 'products.json'), 'utf8'),
+    dataFileBefore,
+    '磁盘上的已有数据文件也不能被失败的保存改动',
+  );
+
+  // 保存条件恢复后：同一份合法内容直接再次提交即可成功，并按既有规则规范化
+  restoreSaving(server.dataDir);
+  const saved = await postProduct(server.url, payload);
+  assert.equal(saved.status, 201, '恢复后同一份合法内容应保存成功，证明此前失败不是输入问题');
+  assert.equal(typeof saved.body.id, 'string');
+  assert.notEqual(saved.body.id, '');
+  assert.equal(saved.body.name, '陶瓷马克杯', '保存成功的名称应去掉首尾空白');
+  assert.ok(!Number.isNaN(Date.parse(saved.body.createdAt)));
+  assert.deepEqual(saved.body.specs, [
+    {
+      attributes: [{ name: '颜色', value: '米白' }, { name: '容量', value: '350ml' }],
+      price: '88.00',
+      stock: 15,
+    },
+    {
+      attributes: [{ name: '颜色', value: '米白' }, { name: '容量', value: '500ml' }],
+      price: '88.50',
+      stock: 0,
+    },
+    {
+      attributes: [{ name: '颜色', value: '湖蓝' }, { name: '容量', value: '350ml' }],
+      price: '92.50',
+      stock: 7,
+    },
+  ], '属性去首尾空白、金额统一为两位小数字符串，各规格库存与属性正确对应');
+
+  const after = await getProducts(server.url);
+  assert.equal(after.length, 3);
+  assert.deepEqual(after[0], saved.body, '新商品应排在列表最前且记录完整');
+  assert.deepEqual(after.slice(1), before, '两件已有商品的记录与相对顺序保持原样');
+});
+
+test('网页：保存失败时停留在表单、保留全部输入并提示未保存，恢复后直接重提成功', async (t) => {
+  if (!CHROME_BIN) { t.skip('未找到 Chrome/Chromium，跳过网页操作回归'); return; }
+
+  const server = await startServer();
+  t.after(() => stopServer(server));
+  const browser = await CdpBrowser.launch();
+  t.after(() => browser.close());
+
+  // 先经接口放一件已有商品：失败提交不能影响它，恢复成功后新商品应排在它前面。
+  const existing = await postProduct(server.url, productPayload('已有商品', [
+    spec([['颜色', '黑色']], '59.00', 12),
+  ]));
+  assert.equal(existing.status, 201);
+  const listBefore = await getProducts(server.url);
+
+  const page = await browser.newPage(`${server.url}/`);
+  assert.deepEqual((await page.eval(LIST_STATE_EXPR)).titles, ['已有商品']);
+
+  // 填写完全合法的内容：名称与属性带首尾空白，售价 '88'、'88.5' 尚未规范化为两位小数。
+  assert.equal(await page.eval(`(function () {
+    document.querySelector('[data-name-input]').value = '  手冲咖啡壶  ';
+    document.getElementById('add-spec').click();
+    var cards = document.querySelectorAll('#specs [data-spec]');
+    cards[0].querySelector('.add-attr').click();
+    var rows0 = cards[0].querySelectorAll('.attr-row');
+    rows0[0].querySelector('[data-attr-name]').value = ' 颜色 ';
+    rows0[0].querySelector('[data-attr-value]').value = ' 米白 ';
+    rows0[1].querySelector('[data-attr-name]').value = '容量';
+    rows0[1].querySelector('[data-attr-value]').value = '350ml';
+    cards[0].querySelector('[data-price]').value = '88';
+    cards[0].querySelector('[data-stock]').value = '15';
+    cards[1].querySelector('[data-attr-name]').value = '颜色';
+    cards[1].querySelector('[data-attr-value]').value = '湖蓝';
+    cards[1].querySelector('[data-price]').value = '88.5';
+    cards[1].querySelector('[data-stock]').value = '0';
+    return cards.length;
+  })()`), 2, '应填好两条规格');
+
+  blockSaving(server.dataDir);
+  t.after(() => restoreSaving(server.dataDir));
+
+  const held = await submitAndHold(page);
+  assert.deepEqual(held.payload, {
+    name: '  手冲咖啡壶  ',
+    specs: [
+      {
+        attributes: [
+          { name: ' 颜色 ', value: ' 米白 ' },
+          { name: '容量', value: '350ml' },
+        ],
+        price: '88',
+        stock: 15,
+      },
+      { attributes: [{ name: '颜色', value: '湖蓝' }], price: '88.5', stock: 0 },
+    ],
+  }, '发出的载荷应与页面填写内容一致（含首尾空白与未规范化金额）');
+  const saving = await page.eval(LOCK_STATE_EXPR);
+  assert.match(saving.statusText, /正在保存/, '等待保存结果期间应显示正在保存');
+  assert.equal(saving.allInputsDisabled, true);
+  await page.continueRequest(held.requestId);
+
+  // ---- 服务器返回 500：停留在当前页面，提示商品未保存，不误报成某条规格填写错误 ----
+  await page.waitFor(
+    "document.getElementById('form-status').className.indexOf('error') >= 0",
+    8000,
+    '保存失败后应转入错误状态而不是一直等待或跳转',
+  );
+  const state = await page.eval(FORM_STATE_EXPR);
+  assert.match(state.statusText, /保存失败/, '应显示保存失败提示');
+  assert.match(state.statusText, /未保存/, '应明确说明商品未保存');
+  assert.doesNotMatch(state.statusText, /未创建/, '保存失败不能误报成校验未通过');
+  assert.equal(state.statusClass, 'error');
+  assert.equal(
+    await page.eval("document.querySelectorAll('#product-form .invalid').length"),
+    0,
+    '保存失败不能把任何输入框标记为填写错误',
+  );
+  assert.equal(
+    await page.eval("Array.prototype.filter.call(document.querySelectorAll('#product-form .err'), function (s) { return s.textContent !== ''; }).length"),
+    0,
+    '保存失败不能在任何规格或字段旁显示填写错误原因',
+  );
+
+  // 用户填入的名称和全部规格保持原样：首尾空白、未规范化金额文字都不被改写
+  assert.equal(state.productName, '  手冲咖啡壶  ', '商品名称原文（含首尾空白）应保留');
+  assert.deepEqual(state.numbers, ['规格 1', '规格 2'], '停留在当前页面，规格编号不变');
+  assert.deepEqual(state.cards.map((card: any) => [card.attrs.map((a: any) => [a.name, a.value]), card.price, card.stock]), [
+    [[[' 颜色 ', ' 米白 '], ['容量', '350ml']], '88', '15'],
+    [[['颜色', '湖蓝']], '88.5', '0'],
+  ], '各规格属性（含首尾空白）、售价原文与库存应原样保留，不串位');
+
+  // 错误响应结束后，提交按钮、输入框及增删规格和属性的操作恢复可用
+  const unlocked = await page.eval(LOCK_STATE_EXPR);
+  assert.equal(unlocked.submitDisabled, false, '失败响应结束后提交按钮应恢复可用');
+  assert.equal(unlocked.addSpecDisabled, false, '添加规格按钮应恢复可用');
+  assert.equal(unlocked.allInputsDisabled, false, '所有输入框应恢复可编辑');
+  assert.equal(unlocked.allButtonsDisabled, false, '增删规格和属性的按钮应恢复可用');
+
+  // 原有列表继续显示失败前的内容，不出现失败商品；接口侧同样没有新记录
+  assert.deepEqual((await page.eval(LIST_STATE_EXPR)).titles, ['已有商品'], '首页列表应保持失败前的内容');
+  assert.deepEqual(await getProducts(server.url), listBefore, '接口侧不能产生新记录或改动已有商品');
+
+  // ---- 保存条件恢复后：保留的合法内容直接再次提交，无需重填 ----
+  restoreSaving(server.dataDir);
+  const retry = await submitAndHold(page);
+  assert.deepEqual(retry.payload, held.payload, '保留的内容应可直接再次提交，用户不必重填整件商品');
+  await page.continueRequest(retry.requestId);
+
+  await page.waitFor(
+    "document.querySelector('[data-name-input]').value === '' && document.querySelectorAll('#product-list .product').length === 2",
+    8000,
+    '恢复后再次提交应成功并返回列表页面',
+  );
+  const list = await page.eval(LIST_STATE_EXPR);
+  assert.deepEqual(list.titles, ['手冲咖啡壶', '已有商品'], '新商品排在最前，名称按去除首尾空白展示');
+  assert.deepEqual(list.products[0], {
+    name: '手冲咖啡壶',
+    specs: [
+      { attrs: ['颜色：米白', '容量：350ml'], price: '¥88.00', stock: '库存 15', outOfStock: false },
+      { attrs: ['颜色：湖蓝'], price: '¥88.50', stock: '库存 0', outOfStock: true },
+    ],
+  }, '成功保存后属性去首尾空白、金额统一为两位小数，零库存规格标记缺货');
+
+  const products = await getProducts(server.url);
+  assert.equal(products.length, 2);
+  assert.equal(products[0].name, '手冲咖啡壶');
+  assert.deepEqual(products[0].specs, [
+    {
+      attributes: [{ name: '颜色', value: '米白' }, { name: '容量', value: '350ml' }],
+      price: '88.00',
+      stock: 15,
+    },
+    { attributes: [{ name: '颜色', value: '湖蓝' }], price: '88.50', stock: 0 },
+  ], '接口保存的内容与页面展示一致，各规格库存与属性正确对应');
   assert.deepEqual(products[1], listBefore[0], '已有商品的规格、售价和库存始终保持原样');
   assert.equal(products[1].id, existing.body.id);
 });
