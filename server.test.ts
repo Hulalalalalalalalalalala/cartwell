@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { spawn, type ChildProcess } from 'node:child_process';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { spawn, spawnSync, type ChildProcess } from 'node:child_process';
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { once } from 'node:events';
@@ -763,4 +763,566 @@ test('一件商品混有合法与非法售价规格时整个商品都不创建�
     !JSON.stringify(after).includes('合法规格') && !JSON.stringify(after).includes('中间合法规格'),
     '被拒商品中的合法规格也不能以任何形式残留',
   );
+});
+
+// ---------- 网页操作回归：动态规格表单的填写、删除、报错定位、内容保留与修正重提 ----------
+//
+// 上面的用例只验证接口与列表；这里用真实浏览器（headless Chrome + DevTools Protocol，
+// 不引入第三方依赖）操作首页表单，保护用户遇到字段错误后的完整体验：
+// 删除规格/属性后页面编号连续且提交载荷与当前页面一致；400 后停留在表单、保留全部输入、
+// 错误原因与输入框标记精确对应当前留下的规格和属性；修正后直接重提即可成功。
+
+interface CdpMessage {
+  id?: number;
+  method?: string;
+  params?: any;
+  result?: any;
+  error?: any;
+  sessionId?: string;
+}
+
+function findChrome(): string | undefined {
+  if (process.env.CHROME_BIN) return process.env.CHROME_BIN;
+  const probe = spawnSync(
+    'sh',
+    ['-c', 'command -v google-chrome google-chrome-stable chromium chromium-browser 2>/dev/null | head -n1'],
+    { encoding: 'utf8' },
+  );
+  const found = typeof probe.stdout === 'string' ? probe.stdout.trim() : '';
+  return found === '' ? undefined : found;
+}
+
+const CHROME_BIN = findChrome();
+const CHROME_FLAGS = [
+  '--headless=new',
+  '--disable-gpu',
+  '--no-sandbox',
+  '--disable-dev-shm-usage',
+  '--no-first-run',
+  '--no-default-browser-check',
+  '--disable-background-networking',
+  '--disable-crash-reporter',
+];
+
+class CdpBrowser {
+  private child: ChildProcess;
+  private profileDir: string;
+  private ws: WebSocket;
+  private nextId = 1;
+  private pending = new Map<number, { resolve: (v: any) => void; reject: (e: Error) => void; sessionId?: string }>();
+  private listeners = new Map<string, (method: string, params: any) => void>();
+
+  private constructor(child: ChildProcess, profileDir: string, ws: WebSocket) {
+    this.child = child;
+    this.profileDir = profileDir;
+    this.ws = ws;
+  }
+
+  static async launch(): Promise<CdpBrowser> {
+    const profileDir = mkdtempSync(join(tmpdir(), 'cartwell-chrome-'));
+    const child = spawn(
+      CHROME_BIN!,
+      [...CHROME_FLAGS, '--remote-debugging-port=0', `--user-data-dir=${profileDir}`, 'about:blank'],
+      { stdio: ['ignore', 'ignore', 'pipe'] },
+    );
+    let stderr = '';
+    child.stderr!.setEncoding('utf8');
+    child.stderr.on('data', (chunk: string) => { stderr += chunk; });
+
+    const portFile = join(profileDir, 'DevToolsActivePort');
+    const port = await new Promise<string>((resolve, reject) => {
+      const started = Date.now();
+      const timer = setInterval(() => {
+        try {
+          const line = readFileSync(portFile, 'utf8').split('\n')[0]!.trim();
+          if (line) { clearInterval(timer); resolve(line); }
+        } catch {
+          if (Date.now() - started > 15_000) {
+            clearInterval(timer);
+            reject(new Error(`等待 Chrome 调试端口超时：${stderr.slice(-500)}`));
+          }
+        }
+      }, 50);
+    });
+
+    const version = await (await fetch(`http://127.0.0.1:${port}/json/version`)).json();
+    const ws = new WebSocket(version.webSocketDebuggerUrl as string);
+    await new Promise<void>((resolve, reject) => {
+      ws.onopen = (): void => resolve();
+      ws.onerror = (): void => reject(new Error('无法连接 Chrome DevTools Protocol'));
+    });
+
+    const browser = new CdpBrowser(child, profileDir, ws);
+    ws.onmessage = (event: { data: string }): void => {
+      const message: CdpMessage = JSON.parse(event.data);
+      if (message.id !== undefined) {
+        const entry = browser.pending.get(message.id);
+        if (entry && (entry.sessionId === undefined || entry.sessionId === message.sessionId)) {
+          browser.pending.delete(message.id);
+          if (message.error) entry.reject(new Error(JSON.stringify(message.error)));
+          else entry.resolve(message.result);
+        }
+        return;
+      }
+      if (message.method && message.sessionId) {
+        browser.listeners.get(message.sessionId)?.(message.method, message.params);
+      }
+    };
+    return browser;
+  }
+
+  send(method: string, params: Record<string, unknown> = {}, sessionId?: string): Promise<any> {
+    const id = this.nextId++;
+    return new Promise((resolve, reject) => {
+      this.pending.set(id, { resolve, reject, sessionId });
+      this.ws.send(JSON.stringify({ id, method, params, ...(sessionId ? { sessionId } : {}) }));
+    });
+  }
+
+  async newPage(url: string): Promise<CdpPage> {
+    const { targetId } = await this.send('Target.createTarget', { url: 'about:blank' });
+    const { sessionId } = await this.send('Target.attachToTarget', { targetId, flatten: true });
+    const page = new CdpPage(this, sessionId);
+    this.listeners.set(sessionId, (method, params): void => {
+      if (method === 'Fetch.requestPaused') page.handlePaused(params);
+    });
+    await this.send('Page.enable', {}, sessionId);
+    await this.send('Runtime.enable', {}, sessionId);
+    // 只拦截新增商品请求：在请求真正发出后暂停，便于核对载荷与提交过程中的按钮状态。
+    await this.send('Fetch.enable', {
+      patterns: [{ urlPattern: '*/api/products', requestStage: 'Request' }],
+    }, sessionId);
+    await this.send('Page.navigate', { url }, sessionId);
+    await page.waitFor("document.getElementById('product-form') && document.querySelectorAll('#specs [data-spec]').length === 1");
+    return page;
+  }
+
+  async close(): Promise<void> {
+    try { this.ws.close(); } catch { /* 已关闭 */ }
+    this.child.kill('SIGTERM');
+    await Promise.race([
+      once(this.child, 'exit'),
+      new Promise((resolve) => setTimeout(resolve, 3000)),
+    ]);
+    if (this.child.exitCode === null) this.child.kill('SIGKILL');
+    rmSync(this.profileDir, { recursive: true, force: true });
+  }
+}
+
+class CdpPage {
+  private browser: CdpBrowser;
+  private sessionId: string;
+  private readonly pausedQueue: any[] = [];
+  private readonly pausedWaiters: Array<(params: any) => void> = [];
+
+  constructor(browser: CdpBrowser, sessionId: string) {
+    this.browser = browser;
+    this.sessionId = sessionId;
+  }
+
+  handlePaused(params: any): void {
+    const waiter = this.pausedWaiters.shift();
+    if (waiter) waiter(params);
+    else this.pausedQueue.push(params);
+  }
+
+  send(method: string, params: Record<string, unknown> = {}): Promise<any> {
+    return this.browser.send(method, params, this.sessionId);
+  }
+
+  async eval(expression: string): Promise<any> {
+    const result = await this.send('Runtime.evaluate', {
+      expression,
+      returnByValue: true,
+      awaitPromise: true,
+    });
+    if (result.exceptionDetails) {
+      throw new Error(`页面脚本执行失败：${result.exceptionDetails.text} ${result.exceptionDetails.exception?.description ?? ''}`);
+    }
+    return result.result.value;
+  }
+
+  // 轮询页面上的布尔条件；提交成功后的整页跳转也会经历短暂的上下文切换，忽略期间的异常。
+  async waitFor(expression: string, timeoutMs = 8000, label?: string): Promise<void> {
+    const deadline = Date.now() + timeoutMs;
+    for (;;) {
+      try {
+        if (await this.eval(expression)) return;
+      } catch {
+        if (Date.now() > deadline) throw new Error(`等待页面条件超时：${label ?? expression}`);
+      }
+      if (Date.now() > deadline) throw new Error(`等待页面条件超时：${label ?? expression}`);
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+  }
+
+  async waitPaused(timeoutMs = 8000): Promise<any> {
+    const queued = this.pausedQueue.shift();
+    if (queued) return queued;
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        const index = this.pausedWaiters.indexOf(resolve as any);
+        if (index >= 0) this.pausedWaiters.splice(index, 1);
+        reject(new Error('等待新增商品请求被拦截超时'));
+      }, timeoutMs);
+      this.pausedWaiters.push((params): void => { clearTimeout(timer); resolve(params); });
+    });
+  }
+
+  continueRequest(requestId: string): Promise<any> {
+    return this.send('Fetch.continueRequest', { requestId });
+  }
+}
+
+// 点击提交、在请求被拦截时（服务端尚未响应）核对按钮状态，并返回浏览器实际发送的载荷。
+// requestStage=Request 的暂停事件里 request.postData 就是浏览器实际发送的明文请求体。
+async function submitAndHold(page: CdpPage): Promise<{ requestId: string; payload: any }> {
+  await page.eval("document.getElementById('product-form').requestSubmit()");
+  const paused = await page.waitPaused();
+  assert.equal(paused.request.method, 'POST');
+  assert.equal(
+    await page.eval("document.getElementById('submit-btn').disabled"),
+    true,
+    '提交进行中提交按钮应暂时不可用',
+  );
+  assert.equal(typeof paused.request.postData, 'string', '拦截事件应带实际发送的请求体');
+  return { requestId: paused.requestId, payload: JSON.parse(paused.request.postData) };
+}
+
+// 读取表单当前完整状态：编号、各规格属性/售价/库存的输入值、错误文字与 invalid 标记。
+const FORM_STATE_EXPR = `(function () {
+  function inputState(row) {
+    var n = row.querySelector('[data-attr-name]');
+    var v = row.querySelector('[data-attr-value]');
+    return {
+      name: n.value,
+      value: v.value,
+      nameInvalid: n.classList.contains('invalid'),
+      valueInvalid: v.classList.contains('invalid'),
+      nameErr: row.querySelector('[data-err="attrName"]').textContent,
+      valueErr: row.querySelector('[data-err="attrValue"]').textContent
+    };
+  }
+  var status = document.getElementById('form-status');
+  return {
+    productName: document.querySelector('[data-name-input]').value,
+    nameInvalid: document.querySelector('[data-name-input]').classList.contains('invalid'),
+    nameErr: document.querySelector('[data-err="name"]').textContent,
+    statusText: status.textContent,
+    statusClass: status.className,
+    numbers: Array.prototype.map.call(document.querySelectorAll('[data-spec-no]'), function (el) { return el.textContent; }),
+    cards: Array.prototype.map.call(document.querySelectorAll('#specs [data-spec]'), function (card) {
+      var price = card.querySelector('[data-price]');
+      var stock = card.querySelector('[data-stock]');
+      return {
+        attrs: Array.prototype.map.call(card.querySelectorAll('.attr-row'), inputState),
+        price: price.value,
+        stock: stock.value,
+        priceInvalid: price.classList.contains('invalid'),
+        stockInvalid: stock.classList.contains('invalid'),
+        priceErr: card.querySelector('[data-err="price"]').textContent,
+        stockErr: card.querySelector('[data-err="stock"]').textContent,
+        specErr: card.querySelector('[data-err="spec"]').textContent,
+        attrsErr: card.querySelector('[data-err="attributes"]').textContent
+      };
+    })
+  };
+})()`;
+
+const LIST_STATE_EXPR = `(function () {
+  return {
+    titles: Array.prototype.map.call(document.querySelectorAll('#product-list .product h3'), function (h3) { return h3.textContent; }),
+    products: Array.prototype.map.call(document.querySelectorAll('#product-list .product'), function (product) {
+      return {
+        name: product.querySelector('h3').textContent,
+        specs: Array.prototype.map.call(product.querySelectorAll('.spec-row'), function (row) {
+          return {
+            attrs: Array.prototype.map.call(row.querySelectorAll('.attr'), function (attr) { return attr.textContent; }),
+            price: row.querySelector('.price').textContent,
+            stock: row.querySelector('.stock').textContent,
+            outOfStock: !!row.querySelector('.badge-oos')
+          };
+        })
+      };
+    })
+  };
+})()`;
+
+// 按真实用户路径填表：名称、三条规格各有两个属性，再删除中间的整条规格和第一条规格里靠前的属性。
+const FILL_AND_DELETE_EXPR = `(function () {
+  document.querySelector('[data-name-input]').value = '  秋冬卫衣  ';
+  document.getElementById('add-spec').click();
+  document.getElementById('add-spec').click();
+  var cards = document.querySelectorAll('#specs [data-spec]');
+  function fill(card, attributeRows, price, stock) {
+    for (var i = card.querySelectorAll('.attr-row').length; i < attributeRows.length; i++) {
+      card.querySelector('.add-attr').click();
+    }
+    var rows = card.querySelectorAll('.attr-row');
+    attributeRows.forEach(function (pair, index) {
+      rows[index].querySelector('[data-attr-name]').value = pair[0];
+      rows[index].querySelector('[data-attr-value]').value = pair[1];
+    });
+    card.querySelector('[data-price]').value = price;
+    card.querySelector('[data-stock]').value = stock;
+  }
+  // 规格 1：颜色/红色（稍后删除）+ 尺码/纯空白值（保留，首次提交因此被拒绝）
+  fill(cards[0], [['颜色', '红色'], ['尺码', '   ']], '88.00', '6');
+  // 规格 2：稍后整条删除，它的属性、售价、库存都不能被带上
+  fill(cards[1], [['颜色', '蓝色'], ['尺码', 'L']], '55.50', '2');
+  // 规格 3：保留，售价 12.345 不合规，库存为零
+  fill(cards[2], [['颜色', '绿色'], ['尺码', '均码']], '12.345', '0');
+  // 删除整条中间规格，再删除第一条规格中靠前的属性
+  cards[1].querySelector('.remove-spec').click();
+  cards[0].querySelectorAll('.remove-attr')[0].click();
+  return document.querySelectorAll('#specs [data-spec]').length;
+})()`;
+
+test('网页：删除规格与属性后提交与当前页面一致；字段错误精确定位并保留输入；修正后直接重提成功', async (t) => {
+  if (!CHROME_BIN) { t.skip('未找到 Chrome/Chromium，跳过网页操作回归'); return; }
+
+  const server = await startServer();
+  t.after(() => stopServer(server));
+  const browser = await CdpBrowser.launch();
+  t.after(() => browser.close());
+
+  // 先经接口放一件已有商品：失败提交不能影响它，成功后新商品应排在它前面。
+  const existing = await postProduct(server.url, productPayload('已有商品', [
+    spec([['颜色', '黑色']], '59.00', 12),
+  ]));
+  assert.equal(existing.status, 201);
+  const listBefore = await getProducts(server.url);
+
+  const page = await browser.newPage(`${server.url}/`);
+  assert.deepEqual(
+    await page.eval(LIST_STATE_EXPR).then((s) => s.titles),
+    ['已有商品'],
+    '首页应展示已存在的商品',
+  );
+
+  assert.equal(await page.eval(FILL_AND_DELETE_EXPR), 2, '删除整条规格后应只剩两张规格卡片');
+  assert.deepEqual(
+    await page.eval("Array.prototype.map.call(document.querySelectorAll('[data-spec-no]'), function (el) { return el.textContent; })"),
+    ['规格 1', '规格 2'],
+    '删除中间规格后，剩余规格的显示编号必须连续重新编号',
+  );
+
+  // ---- 第一次提交：浏览器实际发出的载荷必须与删除后页面上剩余的内容逐字段一致 ----
+  const first = await submitAndHold(page);
+  assert.deepEqual(first.payload, {
+    name: '  秋冬卫衣  ',
+    specs: [
+      { attributes: [{ name: '尺码', value: '   ' }], price: '88.00', stock: 6 },
+      {
+        attributes: [
+          { name: '颜色', value: '绿色' },
+          { name: '尺码', value: '均码' },
+        ],
+        price: '12.345',
+        stock: 0,
+      },
+    ],
+  }, '被删除的规格与属性不能带上；保留的属性、售价、库存必须仍属于原来的规格，不能串位');
+  await page.continueRequest(first.requestId);
+
+  await page.waitFor(
+    "document.getElementById('form-status').className.indexOf('error') >= 0",
+    8000,
+    '首次提交失败后应显示错误状态',
+  );
+  assert.equal(
+    await page.eval("document.getElementById('submit-btn').disabled"),
+    false,
+    '失败响应结束后提交按钮应恢复可用',
+  );
+
+  const state = await page.eval(FORM_STATE_EXPR);
+  assert.match(state.statusText, /未创建/, '页面应明确说明商品没有创建');
+  assert.equal(state.productName, '  秋冬卫衣  ', '商品名称原文（含首尾空白）应保留在输入框');
+  assert.equal(state.nameInvalid, false, '合法的商品名称不应被标记为错误');
+  assert.equal(state.nameErr, '');
+  assert.deepEqual(state.numbers, ['规格 1', '规格 2'], '失败后编号仍连续，表单停留在当前页面');
+
+  assert.equal(state.cards.length, 2);
+  // 留下的第 1 条规格：唯一属性是空白值，错误必须落在该属性值上
+  assert.deepEqual(state.cards[0].attrs, [
+    {
+      name: '尺码', value: '   ',
+      nameInvalid: false, valueInvalid: true,
+      nameErr: '', valueErr: '属性值不能为空',
+    },
+  ], '空白属性值旁应显示原因并标出该输入框；属性名称合法不应被连带标记');
+  assert.equal(state.cards[0].price, '88.00', '合法售价原样保留');
+  assert.equal(state.cards[0].stock, '6', '库存原样保留');
+  assert.equal(state.cards[0].priceInvalid, false, '合法规格的售价不应被标记为同类错误');
+  assert.equal(state.cards[0].priceErr, '');
+  assert.equal(state.cards[0].stockInvalid, false);
+  // 留下的第 2 条规格（原第 3 条）：12.345 售价错误要跟随规格定位到新编号的卡片
+  assert.deepEqual(state.cards[1].attrs.map((a: any) => [a.name, a.value, a.nameInvalid, a.valueInvalid]), [
+    ['颜色', '绿色', false, false],
+    ['尺码', '均码', false, false],
+  ], '保留规格的属性值不串位，且合法属性不应被标记');
+  assert.equal(state.cards[1].price, '12.345', '非法售价原文保留，等待用户修正');
+  assert.equal(state.cards[1].stock, '0', '零库存输入保留，不会因提交失败被丢弃');
+  assert.equal(state.cards[1].priceInvalid, true, '售价输入框应被标出');
+  assert.match(state.cards[1].priceErr, /售价/, '售价旁应显示具体原因');
+  assert.equal(state.cards[1].stockInvalid, false);
+  assert.equal(state.cards[1].stockErr, '');
+  assert.doesNotMatch(
+    JSON.stringify(state),
+    /蓝色|红色|55\.50/,
+    '已删除的规格内容（蓝色/红色及其售价）不能残留在表单状态中',
+  );
+
+  const listAfterFailure = await page.eval(LIST_STATE_EXPR);
+  assert.deepEqual(listAfterFailure.titles, ['已有商品'], '失败停留在表单，已有商品列表保持不变');
+  assert.deepEqual(await getProducts(server.url), listBefore, '接口侧也不能产生新记录或改动已有商品');
+
+  // ---- 只改两处错误：空白属性值改成合规内容、12.345 改成一位小数；不重添规格、不重填名称 ----
+  await page.eval(`(function () {
+    var cards = document.querySelectorAll('#specs [data-spec]');
+    cards[0].querySelectorAll('.attr-row')[0].querySelector('[data-attr-value]').value = '  L码  ';
+    cards[1].querySelector('[data-price]').value = '12.3';
+  })()`);
+
+  const second = await submitAndHold(page);
+  // 再次提交时旧错误应先被清除：请求被拦截时服务端还没返回，页面上不应有任何错误文字或标记
+  const cleared = await page.eval(FORM_STATE_EXPR);
+  assert.equal(cleared.statusText, '');
+  assert.equal(cleared.statusClass, '');
+  assert.equal(
+    await page.eval("document.querySelectorAll('#product-form .invalid').length"),
+    0,
+    '再次提交时旧的错误标记应被清除',
+  );
+  assert.equal(
+    await page.eval("Array.prototype.filter.call(document.querySelectorAll('#product-form .err'), function (s) { return s.textContent !== ''; }).length"),
+    0,
+    '再次提交时旧的错误文字应被清除',
+  );
+  assert.deepEqual(second.payload, {
+    name: '  秋冬卫衣  ',
+    specs: [
+      { attributes: [{ name: '尺码', value: '  L码  ' }], price: '88.00', stock: 6 },
+      {
+        attributes: [
+          { name: '颜色', value: '绿色' },
+          { name: '尺码', value: '均码' },
+        ],
+        price: '12.3',
+        stock: 0,
+      },
+    ],
+  }, '无须重新添加规格或重填名称；修正后的载荷与当前页面一致');
+  await page.continueRequest(second.requestId);
+
+  // 成功后返回首页：整页重新加载（输入框被重置），新商品排在已有商品之前
+  await page.waitFor(
+    "document.querySelector('[data-name-input]').value === '' && document.querySelectorAll('#product-list .product').length === 2",
+    8000,
+    '提交成功后应返回首页并展示两件商品',
+  );
+  const list = await page.eval(LIST_STATE_EXPR);
+  assert.deepEqual(list.titles, ['秋冬卫衣', '已有商品'], '新商品排在已有商品之前，名称按去除首尾空白展示');
+  assert.deepEqual(list.products[0], {
+    name: '秋冬卫衣',
+    specs: [
+      { attrs: ['尺码：L码'], price: '¥88.00', stock: '库存 6', outOfStock: false },
+      { attrs: ['颜色：绿色', '尺码：均码'], price: '¥12.30', stock: '库存 0', outOfStock: true },
+    ],
+  }, '保留的规格按修正后内容展示：属性去空白、售价两位小数；零库存规格仍保存并标记缺货');
+
+  const products = await getProducts(server.url);
+  assert.equal(products.length, 2);
+  assert.equal(products[0].name, '秋冬卫衣');
+  assert.deepEqual(products[0].specs, [
+    { attributes: [{ name: '尺码', value: 'L码' }], price: '88.00', stock: 6 },
+    {
+      attributes: [
+        { name: '颜色', value: '绿色' },
+        { name: '尺码', value: '均码' },
+      ],
+      price: '12.30',
+      stock: 0,
+    },
+  ], '接口保存的内容与页面展示一致，零库存规格未因前一次失败被丢弃');
+  assert.deepEqual(products[1], listBefore[0], '已有商品的规格、售价和库存始终保持原样');
+  assert.equal(products[1].id, existing.body.id);
+});
+
+test('网页：删除最前面的规格后编号连续，售价错误定位到重编号后剩下的规格；修正即成功', async (t) => {
+  if (!CHROME_BIN) { t.skip('未找到 Chrome/Chromium，跳过网页操作回归'); return; }
+
+  const server = await startServer();
+  t.after(() => stopServer(server));
+  const browser = await CdpBrowser.launch();
+  t.after(() => browser.close());
+
+  const page = await browser.newPage(`${server.url}/`);
+  await page.eval(`(function () {
+    document.querySelector('[data-name-input]').value = '删除首规格商品';
+    document.getElementById('add-spec').click();
+    var cards = document.querySelectorAll('#specs [data-spec]');
+    cards[0].querySelector('[data-attr-name]').value = '颜色';
+    cards[0].querySelector('[data-attr-value]').value = '红色';
+    cards[0].querySelector('[data-price]').value = '10.00';
+    cards[0].querySelector('[data-stock]').value = '1';
+    cards[1].querySelector('[data-attr-name]').value = '颜色';
+    cards[1].querySelector('[data-attr-value]').value = '蓝色';
+    cards[1].querySelector('[data-price]').value = '12.345';
+    cards[1].querySelector('[data-stock]').value = '3';
+    // 删除最前面的规格
+    cards[0].querySelector('.remove-spec').click();
+  })()`);
+
+  assert.deepEqual(
+    await page.eval("Array.prototype.map.call(document.querySelectorAll('[data-spec-no]'), function (el) { return el.textContent; })"),
+    ['规格 1'],
+    '删除最前面的规格后，剩下规格显示为规格 1',
+  );
+
+  const first = await submitAndHold(page);
+  assert.deepEqual(first.payload, {
+    name: '删除首规格商品',
+    specs: [
+      { attributes: [{ name: '颜色', value: '蓝色' }], price: '12.345', stock: 3 },
+    ],
+  }, '提交只能包含剩下的这条规格，被删除规格的红色/10.00/1 不能串到它上面');
+  await page.continueRequest(first.requestId);
+
+  await page.waitFor(
+    "document.getElementById('form-status').className.indexOf('error') >= 0",
+    8000,
+    '提交失败后应显示错误状态',
+  );
+  const state = await page.eval(FORM_STATE_EXPR);
+  assert.match(state.statusText, /未创建/);
+  assert.equal(state.cards.length, 1);
+  assert.deepEqual(state.numbers, ['规格 1']);
+  assert.equal(state.cards[0].price, '12.345', '非法售价保留在剩下的规格上');
+  assert.equal(state.cards[0].priceInvalid, true, '错误应标记在重编号后剩下的规格的售价上');
+  assert.match(state.cards[0].priceErr, /售价/);
+  assert.equal(state.cards[0].attrs[0].value, '蓝色');
+  assert.equal(state.cards[0].attrs[0].valueInvalid, false, '合法属性值不应被标记为售价同类错误');
+  assert.doesNotMatch(JSON.stringify(state), /红色/, '已删除规格的属性值不能残留在表单中');
+
+  await page.eval("document.querySelector('#specs [data-spec] [data-price]').value = '12.34'");
+  const second = await submitAndHold(page);
+  assert.equal(
+    await page.eval("document.querySelectorAll('#product-form .invalid').length"),
+    0,
+    '再次提交时旧标记应已清除',
+  );
+  await page.continueRequest(second.requestId);
+
+  await page.waitFor(
+    "document.querySelector('[data-name-input]').value === '' && document.querySelectorAll('#product-list .product').length === 1",
+    8000,
+    '修正后提交应成功并返回首页',
+  );
+  const list = await page.eval(LIST_STATE_EXPR);
+  assert.deepEqual(list.products, [{
+    name: '删除首规格商品',
+    specs: [{ attrs: ['颜色：蓝色'], price: '¥12.34', stock: '库存 3', outOfStock: false }],
+  }]);
 });
