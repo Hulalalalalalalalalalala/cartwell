@@ -765,6 +765,187 @@ test('一件商品混有合法与非法售价规格时整个商品都不创建�
   );
 });
 
+// ---------- 库存校验与保存回归 ----------
+
+// 构造仅含一个「款式」属性的规格，便于单独替换库存观察校验与保存行为。
+function stockSpec(value: string, stock: unknown, price = '10.00') {
+  return { attributes: [{ name: '款式', value }], price, stock };
+}
+
+test('库存为零、普通正整数和安全整数上限都能创建，响应与查询中保持数字类型、原数值和属性对应', async (t) => {
+  const server = await startServer();
+  t.after(() => stopServer(server));
+
+  // 直接读取响应原文：安全整数上限若被按浮点处理，在线路上就会丢位。
+  const response = await fetch(`${server.url}/api/products`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(productPayload('库存边界商品', [
+      stockSpec('零库存款', 0),
+      stockSpec('普通款', 20),
+      stockSpec('上限款', 9007199254740991),
+    ])),
+  });
+  const text = await response.text();
+  assert.equal(response.status, 201);
+  assert.match(text, /"stock":9007199254740991/, '创建响应原文中的上限库存必须逐位保留，不能丢位');
+  const created = JSON.parse(text);
+
+  const cases: Array<[string, number]> = [
+    ['零库存款', 0],
+    ['普通款', 20],
+    ['上限款', 9007199254740991],
+  ];
+  assert.equal(created.specs.length, 3, '混合库存的三条规格都应完整保留，零库存不能导致规格被丢弃');
+  for (const [value, expectedStock] of cases) {
+    const item = specByAttr(created, value);
+    assert.equal(typeof item.stock, 'number', `「${value}」库存必须保持数字类型`);
+    assert.equal(item.stock, expectedStock, `「${value}」库存应保持原数值并对应原属性组合`);
+    assert.ok(Number.isSafeInteger(item.stock));
+  }
+
+  const products = await getProducts(server.url);
+  assert.equal(products.length, 1);
+  assert.deepEqual(products[0], created, '随后查询到的记录应与创建响应完全一致');
+  assert.equal(specByAttr(products[0], '上限款').stock, 9007199254740991, '列表查询同样必须保留上限库存');
+  assert.equal(specByAttr(products[0], '零库存款').stock, 0, '零库存规格在列表中仍然完整存在');
+});
+
+test('首页按每条规格自己的库存展示，只有零库存规格标记缺货，不套给整件商品或其他规格', async (t) => {
+  const server = await startServer();
+  t.after(() => stopServer(server));
+
+  const created = await postProduct(server.url, productPayload('混合库存商品', [
+    stockSpec('有货款', 7),
+    stockSpec('缺货款', 0),
+    stockSpec('上限款', 9007199254740991),
+  ]));
+  assert.equal(created.status, 201);
+
+  const response = await fetch(`${server.url}/`);
+  assert.equal(response.status, 200);
+  const html = await response.text();
+
+  const rows = html.split('<li class="spec-row">').slice(1).map((row) => row.split('</li>')[0]);
+  assert.equal(rows.length, 3, '三条规格都应在首页展示，零库存规格不能被丢弃');
+  const expectedRows: Array<[string, string, boolean]> = [
+    ['有货款', '库存 7', false],
+    ['缺货款', '库存 0', true],
+    ['上限款', '库存 9007199254740991', false],
+  ];
+  rows.forEach((row, index) => {
+    const [value, stockText, outOfStock] = expectedRows[index]!;
+    assert.ok(row.includes(`款式：${value}`), `第 ${index + 1} 条规格应展示原属性组合「${value}」`);
+    assert.ok(
+      row.includes(`<span class="stock">${stockText}</span>`),
+      `「${value}」应显示自己的库存「${stockText}」，实际行：${row}`,
+    );
+    assert.equal(
+      row.includes('badge-oos'), outOfStock,
+      `「${value}」${outOfStock ? '应' : '不应'}带缺货标记`,
+    );
+    if (outOfStock) assert.ok(row.includes('缺货'), '零库存规格行内应出现「缺货」字样');
+  });
+  assert.equal(
+    (html.match(/class="badge badge-oos"/g) ?? []).length,
+    1,
+    '整个商品只能有一个缺货标记，不能套给整件商品或有库存的规格',
+  );
+});
+
+test('负数、小数、超过安全整数上限、字符串、空值与缺少库存字段都返回 400 并指出规格与库存字段', async (t) => {
+  const server = await startServer();
+  t.after(() => stopServer(server));
+
+  const badSpecs: Array<[string, unknown]> = [
+    ['负数', stockSpec('负数款', -1)],
+    ['负小数', stockSpec('负小数款', -0.5)],
+    ['小数', stockSpec('小数款', 1.5)],
+    ['超过安全整数上限', stockSpec('超上限款', 9007199254740992)],
+    ['远超上限的整数', stockSpec('超大款', 1e20)],
+    ['字符串数字', stockSpec('字符串款', '5')],
+    ['空值 null', stockSpec('空值款', null)],
+    ['缺少库存字段', { attributes: [{ name: '款式', value: '缺字段款' }], price: '10.00' }],
+  ];
+
+  for (const [label, badSpec] of badSpecs) {
+    const result = await postProduct(server.url, productPayload(`非法库存-${label}`, [badSpec]));
+    assert.equal(result.status, 400, `库存「${label}」应被拒绝`);
+
+    const stockErrors = result.body.details.filter((detail: any) => detail.field === 'stock');
+    assert.equal(stockErrors.length, 1, `「${label}」应只有一条库存错误`);
+    assert.equal(stockErrors[0].specIndex, 0, `「${label}」的错误应指出第 1 条规格`);
+    assert.equal(stockErrors[0].path, 'specs[0].stock', `「${label}」的错误路径应指向库存字段`);
+    assert.match(stockErrors[0].message, /库存/, `「${label}」的错误说明应明确是库存问题`);
+    assert.ok(
+      result.body.details.every((detail: any) => detail.field === 'stock'),
+      `名称、属性、售价均合规时，「${label}」不应产生库存以外的错误`,
+    );
+
+    assert.deepEqual(await getProducts(server.url), [], `「${label}」被拒绝后不能留下商品记录`);
+  }
+});
+
+test('一件商品混合合法与非法库存时整件商品都不保存，多条库存错误分别指出各自位置，已有商品保持原样', async (t) => {
+  const server = await startServer();
+  t.after(() => stopServer(server));
+
+  const existing = await postProduct(server.url, productPayload('已有商品', [
+    stockSpec('黑色款', 12, '59.00'),
+    stockSpec('白色款', 0, '69.5'), // 零库存与一位小数规范化都应原样保留
+  ]));
+  assert.equal(existing.status, 201);
+  const before = await getProducts(server.url);
+  assert.equal(before.length, 1);
+
+  const rejected = await postProduct(server.url, productPayload('混合库存商品', [
+    stockSpec('合法零库存款', 0),
+    stockSpec('非法负数款', -2),
+    stockSpec('合法上限款', 9007199254740991),
+    stockSpec('非法小数款', 2.5),
+    stockSpec('非法字符串款', '10'),
+  ]));
+  assert.equal(rejected.status, 400);
+
+  const stockErrors = rejected.body.details.filter((detail: any) => detail.field === 'stock');
+  assert.deepEqual(
+    stockErrors.map((detail: any) => detail.specIndex).sort((a: number, b: number) => a - b),
+    [1, 3, 4],
+    '三条非法库存规格的位置都应被分别指出',
+  );
+  for (const specIndex of [1, 3, 4]) {
+    assert.ok(
+      stockErrors.some((detail: any) => detail.specIndex === specIndex && detail.path === `specs[${specIndex}].stock`),
+      `第 ${specIndex + 1} 条规格的库存字段应被单独指出`,
+    );
+  }
+  assert.ok(
+    ![0, 2].some((index) => stockErrors.some((detail: any) => detail.specIndex === index)),
+    '库存合法的规格（含零库存与安全整数上限）不应被误报',
+  );
+
+  const after = await getProducts(server.url);
+  assert.deepEqual(after, before, '已有商品的名称、属性、售价、库存及列表顺序必须保持原样');
+  assert.deepEqual(specByAttr(after[0], '黑色款'), {
+    attributes: [{ name: '款式', value: '黑色款' }],
+    price: '59.00',
+    stock: 12,
+  });
+  assert.deepEqual(specByAttr(after[0], '白色款'), {
+    attributes: [{ name: '款式', value: '白色款' }],
+    price: '69.50',
+    stock: 0,
+  });
+  assert.ok(
+    after.every((product) => product.name !== '混合库存商品'),
+    '整件商品都不保存，列表中不能出现被拒绝的商品',
+  );
+  assert.ok(
+    !JSON.stringify(after).includes('合法零库存款') && !JSON.stringify(after).includes('合法上限款'),
+    '不能留下只包含合法规格的新商品',
+  );
+});
+
 // ---------- 网页操作回归：动态规格表单的填写、删除、报错定位、内容保留与修正重提 ----------
 //
 // 上面的用例只验证接口与列表；这里用真实浏览器（headless Chrome + DevTools Protocol，
@@ -1596,4 +1777,163 @@ test('网页：单条规格等待期间同样锁定；网络失败后恢复操�
     specs: [{ attrs: ['颜色：红色'], price: '¥10.00', stock: '库存 2', outOfStock: false }],
   }]);
   assert.equal((await getProducts(server.url)).length, 1, '失败的请求没有产生记录');
+});
+
+test('网页：库存留空、负数、小数与超安全整数范围不会变成合法整数保存；错误精确定位并保留内容，只改库存即可重提成功', async (t) => {
+  if (!CHROME_BIN) { t.skip('未找到 Chrome/Chromium，跳过网页操作回归'); return; }
+
+  const server = await startServer();
+  t.after(() => stopServer(server));
+  const browser = await CdpBrowser.launch();
+  t.after(() => browser.close());
+
+  // 先经接口放一件已有商品：失败提交不能影响它，成功后新商品应排在它前面。
+  const existing = await postProduct(server.url, productPayload('已有商品', [
+    spec([['颜色', '黑色']], '59.00', 12),
+  ]));
+  assert.equal(existing.status, 201);
+  const listBefore = await getProducts(server.url);
+
+  const page = await browser.newPage(`${server.url}/`);
+  // 五条规格：留空、负数、小数、超安全整数范围各一条（都应被拒绝），外加一条合法库存。
+  await page.eval(`(function () {
+    document.querySelector('[data-name-input]').value = '库存表单商品';
+    for (var i = 0; i < 4; i++) document.getElementById('add-spec').click();
+    var cards = document.querySelectorAll('#specs [data-spec]');
+    function fill(card, value, stock) {
+      card.querySelector('[data-attr-name]').value = '款式';
+      card.querySelector('[data-attr-value]').value = value;
+      card.querySelector('[data-price]').value = '10.00';
+      card.querySelector('[data-stock]').value = stock;
+    }
+    fill(cards[0], '留空款', '');
+    fill(cards[1], '负数款', '-3');
+    fill(cards[2], '小数款', '1.5');
+    fill(cards[3], '超范围款', '9007199254740992');
+    fill(cards[4], '合法款', '8');
+  })()`);
+
+  // ---- 第一次提交：非法库存必须以原文（或 null）发出，不能先变成另一个合法整数 ----
+  const first = await submitAndHold(page);
+  assert.deepEqual(first.payload, {
+    name: '库存表单商品',
+    specs: [
+      { attributes: [{ name: '款式', value: '留空款' }], price: '10.00', stock: null },
+      { attributes: [{ name: '款式', value: '负数款' }], price: '10.00', stock: '-3' },
+      { attributes: [{ name: '款式', value: '小数款' }], price: '10.00', stock: '1.5' },
+      { attributes: [{ name: '款式', value: '超范围款' }], price: '10.00', stock: '9007199254740992' },
+      { attributes: [{ name: '款式', value: '合法款' }], price: '10.00', stock: 8 },
+    ],
+  }, '留空不能当作零，负数/小数/超范围输入不能先变成另一个合法整数再提交；合法库存正常转为数字');
+  await page.continueRequest(first.requestId);
+
+  await page.waitFor(
+    "document.getElementById('form-status').className.indexOf('error') >= 0",
+    8000,
+    '库存校验失败后应显示错误状态',
+  );
+
+  // ---- 失败后：名称、全部规格及各字段原文保留；错误只落在四条非法库存上 ----
+  const state = await page.eval(FORM_STATE_EXPR);
+  assert.match(state.statusText, /未创建/, '页面应明确说明商品没有创建');
+  assert.equal(state.productName, '库存表单商品', '商品名称应保留');
+  assert.equal(state.nameInvalid, false);
+  assert.equal(state.cards.length, 5, '全部规格卡片都应保留');
+  assert.deepEqual(state.numbers, ['规格 1', '规格 2', '规格 3', '规格 4', '规格 5']);
+
+  const expectedCards: Array<[string, string, boolean]> = [
+    ['留空款', '', true],
+    ['负数款', '-3', true],
+    ['小数款', '1.5', true],
+    ['超范围款', '9007199254740992', true],
+    ['合法款', '8', false],
+  ];
+  state.cards.forEach((card: any, index: number) => {
+    const [value, stockText, invalid] = expectedCards[index]!;
+    assert.equal(card.attrs[0].value, value, `第 ${index + 1} 条规格的属性值应保留且不串位`);
+    assert.equal(card.attrs[0].valueInvalid, false, `「${value}」属性合法不应被连带标记`);
+    assert.equal(card.price, '10.00', `「${value}」合法售价原样保留`);
+    assert.equal(card.priceInvalid, false, `「${value}」售价不应被连带标记`);
+    assert.equal(card.stock, stockText, `「${value}」库存输入原文应保留，等待用户修正`);
+    assert.equal(card.stockInvalid, invalid, `「${value}」库存输入框${invalid ? '应' : '不应'}被标出`);
+    if (invalid) {
+      assert.match(card.stockErr, /库存/, `「${value}」库存输入旁应显示具体原因`);
+    } else {
+      assert.equal(card.stockErr, '', '合法库存不应显示错误原因');
+    }
+  });
+
+  const listAfterFailure = await page.eval(LIST_STATE_EXPR);
+  assert.deepEqual(listAfterFailure.titles, ['已有商品'], '失败停留在表单，已有商品列表保持不变');
+  assert.deepEqual(await getProducts(server.url), listBefore, '接口侧不能产生新记录或改动已有商品');
+
+  // ---- 只修正四条错误库存（含改为零与安全整数上限），不重填名称、属性或售价 ----
+  await page.eval(`(function () {
+    var cards = document.querySelectorAll('#specs [data-spec]');
+    cards[0].querySelector('[data-stock]').value = '0';
+    cards[1].querySelector('[data-stock]').value = '3';
+    cards[2].querySelector('[data-stock]').value = '2';
+    cards[3].querySelector('[data-stock]').value = '9007199254740991';
+  })()`);
+
+  const second = await submitAndHold(page);
+  // 重新提交时旧的库存错误提示与标记应已清除，页面进入保存中状态。
+  const cleared = await page.eval(FORM_STATE_EXPR);
+  assert.match(cleared.statusText, /正在保存/);
+  assert.equal(
+    await page.eval("document.querySelectorAll('#product-form .invalid').length"),
+    0,
+    '再次提交时旧的库存错误标记应被清除',
+  );
+  assert.equal(
+    await page.eval("Array.prototype.filter.call(document.querySelectorAll('#product-form .err'), function (s) { return s.textContent !== ''; }).length"),
+    0,
+    '再次提交时旧的库存错误提示应被清除',
+  );
+  assert.deepEqual(second.payload, {
+    name: '库存表单商品',
+    specs: [
+      { attributes: [{ name: '款式', value: '留空款' }], price: '10.00', stock: 0 },
+      { attributes: [{ name: '款式', value: '负数款' }], price: '10.00', stock: 3 },
+      { attributes: [{ name: '款式', value: '小数款' }], price: '10.00', stock: 2 },
+      { attributes: [{ name: '款式', value: '超范围款' }], price: '10.00', stock: 9007199254740991 },
+      { attributes: [{ name: '款式', value: '合法款' }], price: '10.00', stock: 8 },
+    ],
+  }, '只修正库存即可重新提交，名称、属性与售价不必重填');
+  await page.continueRequest(second.requestId);
+
+  // ---- 成功后返回首页：新商品排在最前，每条规格显示自己的库存，只有零库存规格缺货 ----
+  await page.waitFor(
+    "document.querySelector('[data-name-input]').value === '' && document.querySelectorAll('#product-list .product').length === 2",
+    8000,
+    '修正后提交应成功并返回首页',
+  );
+  const list = await page.eval(LIST_STATE_EXPR);
+  assert.deepEqual(list.titles, ['库存表单商品', '已有商品'], '新商品排在已有商品之前');
+  assert.deepEqual(list.products[0], {
+    name: '库存表单商品',
+    specs: [
+      { attrs: ['款式：留空款'], price: '¥10.00', stock: '库存 0', outOfStock: true },
+      { attrs: ['款式：负数款'], price: '¥10.00', stock: '库存 3', outOfStock: false },
+      { attrs: ['款式：小数款'], price: '¥10.00', stock: '库存 2', outOfStock: false },
+      { attrs: ['款式：超范围款'], price: '¥10.00', stock: '库存 9007199254740991', outOfStock: false },
+      { attrs: ['款式：合法款'], price: '¥10.00', stock: '库存 8', outOfStock: false },
+    ],
+  }, '每条规格显示自己的库存；缺货标记只属于零库存规格，安全整数上限完整显示');
+
+  const products = await getProducts(server.url);
+  assert.equal(products.length, 2);
+  assert.deepEqual(
+    products[0].specs.map((item: any) => [item.attributes[0].value, typeof item.stock, item.stock]),
+    [
+      ['留空款', 'number', 0],
+      ['负数款', 'number', 3],
+      ['小数款', 'number', 2],
+      ['超范围款', 'number', 9007199254740991],
+      ['合法款', 'number', 8],
+    ],
+    '接口保存的库存保持数字类型与原数值，并对应原来的属性组合',
+  );
+  assert.deepEqual(products[1], listBefore[0], '已有商品的规格、售价和库存始终保持原样');
+  assert.equal(products[1].id, existing.body.id);
 });
