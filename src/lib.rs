@@ -26,6 +26,34 @@ impl Sha256Digest {
         }
         hex
     }
+
+    /// 从十六进制文本的原始字节解析摘要。
+    ///
+    /// 这是摘要文字还原的唯一规则：[`FromStr`] 只是在 `&str` 上委托给本
+    /// 方法，命令行核对摘要时也直接使用它，因此从文本解析、按值比较与再次
+    /// 显示永远遵循同一套规则。接受 `0-9`、`a-f` 和 `A-F`，大小写混用表示
+    /// 同一个 32 字节值；解析结果可与 [`digest_reader`] 的结果直接比较，
+    /// 再经 [`to_hex`](Self::to_hex) 显示时始终是完整的 64 个小写十六进制
+    /// 字符，前导零不会丢失。
+    ///
+    /// 入参按原始字节处理，不要求是合法 UTF-8（例如操作系统给出的命令行
+    /// 参数可能无法解码）：长度先按字节数判断，必须恰好为 64；长度正确时
+    /// 报告首个非法字节从零开始的字节偏移。不做任何裁剪或修正，空白、末尾
+    /// 换行、`0x` 前缀以及非 ASCII 字节都属于格式错误。
+    pub fn from_hex_bytes(bytes: &[u8]) -> Result<Sha256Digest, ParseDigestError> {
+        if bytes.len() != 64 {
+            return Err(ParseDigestError::InvalidLength(bytes.len()));
+        }
+        let mut out = [0u8; 32];
+        for (i, pair) in bytes.chunks_exact(2).enumerate() {
+            let hi = hex_nibble(pair[0])
+                .ok_or(ParseDigestError::InvalidHexChar(2 * i))?;
+            let lo = hex_nibble(pair[1])
+                .ok_or(ParseDigestError::InvalidHexChar(2 * i + 1))?;
+            out[i] = (hi << 4) | lo;
+        }
+        Ok(Sha256Digest(out))
+    }
 }
 
 impl fmt::Display for Sha256Digest {
@@ -106,19 +134,7 @@ impl std::str::FromStr for Sha256Digest {
     /// 分隔符以及全角数字等非 ASCII 内容都属于格式错误。长度按输入的
     /// UTF-8 字节数判断，非法字符的位置也按字节偏移报告。
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let bytes = s.as_bytes();
-        if bytes.len() != 64 {
-            return Err(ParseDigestError::InvalidLength(bytes.len()));
-        }
-        let mut out = [0u8; 32];
-        for (i, pair) in bytes.chunks_exact(2).enumerate() {
-            let hi = hex_nibble(pair[0])
-                .ok_or(ParseDigestError::InvalidHexChar(2 * i))?;
-            let lo = hex_nibble(pair[1])
-                .ok_or(ParseDigestError::InvalidHexChar(2 * i + 1))?;
-            out[i] = (hi << 4) | lo;
-        }
-        Ok(Sha256Digest(out))
+        Sha256Digest::from_hex_bytes(s.as_bytes())
     }
 }
 
@@ -498,6 +514,36 @@ mod tests {
         assert_eq!(hex.len(), 64);
         assert!(hex.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
         assert!(!hex.chars().any(char::is_whitespace));
+    }
+
+    #[test]
+    fn from_hex_bytes_shares_the_from_str_rule_and_accepts_non_utf8_source() {
+        use std::str::FromStr;
+        let hex = "d7a8fbb307d7809469ca9abcb0082e4f8d5651e46d3cdb762d02d0bf37c9e592";
+
+        // 字节级解析与 FromStr 是同一条规则：相同字节得到相同摘要，
+        // 命令行参数（可能不是合法 UTF-8）也可直接走这里。
+        let from_bytes = Sha256Digest::from_hex_bytes(hex.as_bytes()).unwrap();
+        assert_eq!(from_bytes, Sha256Digest::from_str(hex).unwrap());
+        assert_eq!(from_bytes.to_hex(), hex);
+
+        // 字节级入口不要求合法 UTF-8：长度先按原始字节判断，
+        // 非 ASCII 字节在长度为 64 时按字节偏移报非法字符。
+        let mut raw = hex.as_bytes().to_vec();
+        raw[63] = b'G';
+        assert_eq!(
+            Sha256Digest::from_hex_bytes(&raw).unwrap_err(),
+            ParseDigestError::InvalidHexChar(63)
+        );
+        raw[63] = 0xff; // 64 个原始字节，但无法整体解码为 UTF-8
+        assert_eq!(
+            Sha256Digest::from_hex_bytes(&raw).unwrap_err(),
+            ParseDigestError::InvalidHexChar(63)
+        );
+        assert_eq!(
+            Sha256Digest::from_hex_bytes(b"").unwrap_err(),
+            ParseDigestError::InvalidLength(0)
+        );
     }
 
     #[test]

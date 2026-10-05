@@ -1,3 +1,4 @@
+use inkseal::{ParseDigestError, Sha256Digest};
 use std::env;
 use std::ffi::OsStr;
 use std::fs::File;
@@ -61,43 +62,30 @@ fn run_digest(path: &Path) -> ExitCode {
     }
 }
 
-/// 解析用户给出的预期摘要：必须恰好是 64 个 ASCII 十六进制字符（大小写
-/// 均可），按其表示的 32 字节摘要值比较。不做任何空白裁剪——前缀、空格、
-/// 末尾换行、长度不对或含非十六进制字符都视为格式错误。参数无法解码为
-/// 合法文字同样视为格式错误。
-fn parse_expected_digest(arg: &OsStr) -> Result<[u8; 32], String> {
-    let bytes = arg.as_encoded_bytes();
-    if bytes.len() != 64 {
-        return Err(format!(
-            "expected digest must be exactly 64 ASCII hexadecimal characters, got {}",
-            bytes.len()
-        ));
-    }
-    let mut out = [0u8; 32];
-    for (i, pair) in bytes.chunks(2).enumerate() {
-        let hi = hex_nibble(pair[0])
-            .ok_or_else(|| "expected digest contains a non-hexadecimal character".to_string())?;
-        let lo = hex_nibble(pair[1])
-            .ok_or_else(|| "expected digest contains a non-hexadecimal character".to_string())?;
-        out[i] = (hi << 4) | lo;
-    }
-    Ok(out)
-}
-
-fn hex_nibble(b: u8) -> Option<u8> {
-    match b {
-        b'0'..=b'9' => Some(b - b'0'),
-        b'a'..=b'f' => Some(b - b'a' + 10),
-        b'A'..=b'F' => Some(b - b'A' + 10),
-        _ => None,
-    }
+/// 解析用户给出的预期摘要。
+///
+/// 解析规则完全来自库（[`Sha256Digest::from_hex_bytes`]），与库的
+/// `FromStr` 以及摘要的再次显示共用同一套实现：必须恰好是 64 个 ASCII
+/// 十六进制字符（大小写均可），按其表示的 32 字节摘要值比较，不做任何
+/// 空白裁剪——前缀、空格、末尾换行、长度不对或含非十六进制字符都视为
+/// 格式错误；参数无法解码为合法文字时，直接按其原始字节校验，同样视为
+/// 格式错误。这里只负责把库的类型化错误映射为本命令既有的提示文字。
+fn parse_expected_digest(arg: &OsStr) -> Result<Sha256Digest, String> {
+    Sha256Digest::from_hex_bytes(arg.as_encoded_bytes()).map_err(|err| match err {
+        ParseDigestError::InvalidLength(len) => format!(
+            "expected digest must be exactly 64 ASCII hexadecimal characters, got {len}"
+        ),
+        ParseDigestError::InvalidHexChar(_) => {
+            "expected digest contains a non-hexadecimal character".to_string()
+        }
+    })
 }
 
 fn run_check_digest(path: &Path, expected_arg: &OsStr) -> ExitCode {
     // 先校验摘要格式；格式不合法时绝不打开文件——即使路径本身也不存在，
     // 仍报告摘要格式问题。
     let expected = match parse_expected_digest(expected_arg) {
-        Ok(bytes) => bytes,
+        Ok(digest) => digest,
         Err(reason) => {
             eprintln!("inkseal: invalid expected digest: {reason}");
             eprintln!("{USAGE}");
@@ -123,18 +111,14 @@ fn run_check_digest(path: &Path, expected_arg: &OsStr) -> ExitCode {
         }
     };
 
-    if actual.as_bytes() == &expected {
+    if actual == expected {
         println!("OK");
         ExitCode::SUCCESS
     } else {
-        // 内容不匹配：预期与实际都以 64 个小写十六进制字符呈现。
-        let mut expected_hex = String::with_capacity(64);
-        for byte in expected {
-            use std::fmt::Write as _;
-            let _ = write!(expected_hex, "{byte:02x}");
-        }
+        // 内容不匹配：预期与实际都用库的同一显示规则呈现为
+        // 64 个小写十六进制字符（大小写混用的输入也规范为小写）。
         eprintln!("inkseal: digest mismatch for '{display}'");
-        eprintln!("expected: {expected_hex}");
+        eprintln!("expected: {}", expected.to_hex());
         eprintln!("actual:   {}", actual.to_hex());
         ExitCode::FAILURE
     }
