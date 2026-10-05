@@ -108,22 +108,23 @@ fn emit_error(code: u8, message: &[u8]) -> ExitCode {
     ExitCode::from(code)
 }
 
-/// 直接对标准错误的原始文件描述符发起 `write`，绕过标准库 `Stderr`
-/// 的行缓冲以及 `eprintln!`/`writeln!` 在写失败时的 panic（宏内部
-/// `unwrap`）。短写照常续写到同一 fd；EINTR 立即重试。任何无法继续
-/// 写入的错误都返回，由调用方决定忽略——失败提示本身绝不能再崩溃。
+/// 把 `data` 完整写到给定输出端：成功结果与失败提示共用的唯一交付规则。
+///
+/// 只要输出端仍可继续接收，临时中断（EINTR）原地重试、一次只接收部分
+/// 字节（短写）就续写剩余部分，直到全部字节交付完毕——最终内容完整、
+/// 顺序不变且没有重复。真正的写入错误结束本次交付并返回该错误；对正数
+/// 计数的 write 返回 0 没有任何进展，按失败处理而不是空转。`target`
+/// 只用于“毫无进展”这条合成错误的文字，系统给出的真实错误原样返回。
 #[cfg(unix)]
-fn write_stderr_all(mut message: &[u8]) -> io::Result<()> {
+fn write_fd_all(fd: std::os::fd::RawFd, mut data: &[u8], target: &'static str) -> io::Result<()> {
     use std::os::raw::c_void;
-    use std::os::fd::RawFd;
 
     unsafe extern "C" {
-        fn write(fd: RawFd, buf: *const c_void, count: usize) -> isize;
+        fn write(fd: std::os::fd::RawFd, buf: *const c_void, count: usize) -> isize;
     }
 
-    const STDERR_FD: RawFd = 2;
-    while !message.is_empty() {
-        let written = unsafe { write(STDERR_FD, message.as_ptr().cast::<c_void>(), message.len()) };
+    while !data.is_empty() {
+        let written = unsafe { write(fd, data.as_ptr().cast::<c_void>(), data.len()) };
         if written < 0 {
             let err = io::Error::last_os_error();
             // 临时中断不代表任何字节的命运，原地重试。
@@ -138,72 +139,54 @@ fn write_stderr_all(mut message: &[u8]) -> io::Result<()> {
             // 避免在此空转。
             return Err(io::Error::new(
                 io::ErrorKind::WriteZero,
-                "write to standard error returned no progress",
+                format!("write to {target} returned no progress"),
             ));
         }
-        message = &message[n..];
+        data = &data[n..];
     }
     Ok(())
 }
 
-/// 非 Unix 目标：沿用加锁写入并显式刷新；写失败同样由调用方忽略。
+/// 非 Unix 目标：标准库句柄不存在上述特殊处理，沿用加锁写入并显式刷新。
+/// `write_all` 内部已处理短写与 EINTR，语义与 Unix 路径一致。
 #[cfg(not(unix))]
-fn write_stderr_all(message: &[u8]) -> io::Result<()> {
+fn write_locked_all(mut handle: impl std::io::Write, data: &[u8]) -> io::Result<()> {
     use std::io::Write;
 
-    let stderr = io::stderr();
-    let mut handle = stderr.lock();
-    handle.write_all(message)?;
+    handle.write_all(data)?;
     handle.flush()
 }
 
 /// 直接对标准输出的原始文件描述符发起 `write`，绕过标准库 `Stdout`
 /// 对“输出端不存在/拒绝写入”这类失败的特殊处理——它在某些情况下会把
 /// 失败（如 fd 以只读方式打开时内核返回的 EBADF）静默报告为成功，导致
-/// 调用方误以为结果已交付。短写照常续写到同一 fd；EINTR 立即重试。
+/// 调用方误以为结果已交付。
 #[cfg(unix)]
-fn write_stdout_all(mut line: &[u8]) -> io::Result<()> {
-    use std::os::raw::c_void;
-    use std::os::fd::RawFd;
-
-    unsafe extern "C" {
-        fn write(fd: RawFd, buf: *const c_void, count: usize) -> isize;
-    }
-
-    const STDOUT_FD: RawFd = 1;
-    while !line.is_empty() {
-        let written = unsafe { write(STDOUT_FD, line.as_ptr().cast::<c_void>(), line.len()) };
-        if written < 0 {
-            let err = io::Error::last_os_error();
-            // 临时中断不代表任何字节的命运，原地重试。
-            if err.kind() == io::ErrorKind::Interrupted {
-                continue;
-            }
-            return Err(err);
-        }
-        let n = written as usize;
-        if n == 0 {
-            // 对正数计数的 write 返回 0 没有可恢复的含义，按写出失败处理，
-            // 避免在此空转。
-            return Err(io::Error::new(
-                io::ErrorKind::WriteZero,
-                "write to standard output returned no progress",
-            ));
-        }
-        line = &line[n..];
-    }
-    Ok(())
+fn write_stdout_all(line: &[u8]) -> io::Result<()> {
+    const STDOUT_FD: std::os::fd::RawFd = 1;
+    write_fd_all(STDOUT_FD, line, "standard output")
 }
 
 /// 非 Unix 目标：标准库句柄不存在上述特殊处理，沿用加锁写入并显式刷新。
 #[cfg(not(unix))]
 fn write_stdout_all(line: &[u8]) -> io::Result<()> {
-    use std::io::Write;
+    write_locked_all(io::stdout().lock(), line)
+}
 
-    let stdout = io::stdout();
-    let mut handle = stdout.lock();
-    handle.write_all(line)?;
-    handle.flush()
+/// 直接对标准错误的原始文件描述符发起 `write`，绕过标准库 `Stderr`
+/// 的行缓冲以及 `eprintln!`/`writeln!` 在写失败时的 panic（宏内部
+/// `unwrap`）。任何无法继续写入的错误都返回，由调用方决定忽略——
+/// 失败提示本身绝不能再崩溃。
+#[cfg(unix)]
+fn write_stderr_all(message: &[u8]) -> io::Result<()> {
+    const STDERR_FD: std::os::fd::RawFd = 2;
+    write_fd_all(STDERR_FD, message, "standard error")
+}
+
+/// 非 Unix 目标：沿用加锁写入并显式刷新；写失败同样由调用方忽略。
+#[cfg(not(unix))]
+fn write_stderr_all(message: &[u8]) -> io::Result<()> {
+    write_locked_all(io::stderr().lock(), message)
 }
 
 /// 解析用户给出的预期摘要。
