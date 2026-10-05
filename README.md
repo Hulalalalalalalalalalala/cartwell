@@ -128,3 +128,39 @@ assert_eq!(
 `Sha256Digest`（可用 `to_hex()` 或 `Display` 得到与命令行一致的十六
 进制文本）；读取失败时返回类型化的 `DigestError`，不会把失败当作
 成功摘要。密码运算基于 `sha2`（RustCrypto）实现。
+
+### 从文本还原已保存的摘要
+
+`Sha256Digest` 实现了标准库的 `FromStr`，调用方可以用 Rust 常规的
+字符串解析方式（`str::parse` 或 `Sha256Digest::from_str`）把先前保存
+的摘要文本还原成摘要对象，与计算结果直接比较：
+
+```rust
+use inkseal::{digest_reader, Sha256Digest};
+
+let computed = digest_reader(&b"abc"[..]).unwrap();
+let saved = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+let restored: Sha256Digest = saved.parse().unwrap();
+assert_eq!(restored, computed);
+```
+
+解析结果与计算结果是同一类型，`as_bytes()`、`to_hex()` 和 `Display`
+都可直接使用；输出仍然是 64 个小写十六进制字符（保留前导零）。
+
+**格式是严格的**：输入必须恰好是 64 个 ASCII 十六进制字符。`0-9`、
+`a-f`、`A-F` 均可，大小写混用表示同一个摘要。解析不做任何裁剪或
+修正——首尾空白、末尾换行、`0x` 前缀、分隔符，以及全角数字或字母
+等非 ASCII 内容都属于格式错误；空字符串也不会被当作空文件的摘要。
+
+解析失败时得到公开的类型化错误 `ParseDigestError`，两类失败可按
+变体区分：
+
+- `ParseDigestError::InvalidLength(n)`：输入的 UTF-8 字节长度不是
+  64，`n` 是实际字节长度（也可用 `actual_length()` 取得）。注意
+  长度按字节数判断，全角字符一个字符占多个字节。
+- `ParseDigestError::InvalidHexChar(pos)`：长度正确但含非法字符，
+  `pos` 是首个非法字节从零开始的字节偏移（也可用
+  `invalid_position()` 取得），按原始文本的字节计算，不按字符个数。
+
+该错误实现了 `Display` 和 `std::error::Error`，可直接显示或装入
+`Box<dyn Error>` 传递。

@@ -40,6 +40,88 @@ impl fmt::Debug for Sha256Digest {
     }
 }
 
+/// 从十六进制文本解析 [`Sha256Digest`] 失败时返回的类型化错误。
+///
+/// 两类失败可以按变体区分：长度不符时携带输入的实际 UTF-8 字节长度；
+/// 长度正确但含非法字符时携带首个非法字节从零开始的字节偏移。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ParseDigestError {
+    /// 输入的 UTF-8 字节长度不是 64；携带实际字节长度。
+    InvalidLength(usize),
+    /// 长度为 64 但含有非十六进制字符；携带首个非法字节的字节偏移
+    /// （按原始文本的字节计算，不按字符个数）。
+    InvalidHexChar(usize),
+}
+
+impl ParseDigestError {
+    /// 长度不符时返回输入的实际字节长度，否则返回 `None`。
+    pub fn actual_length(&self) -> Option<usize> {
+        match self {
+            ParseDigestError::InvalidLength(len) => Some(*len),
+            ParseDigestError::InvalidHexChar(_) => None,
+        }
+    }
+
+    /// 含非法字符时返回首个非法字节的字节偏移，否则返回 `None`。
+    pub fn invalid_position(&self) -> Option<usize> {
+        match self {
+            ParseDigestError::InvalidLength(_) => None,
+            ParseDigestError::InvalidHexChar(pos) => Some(*pos),
+        }
+    }
+}
+
+impl fmt::Display for ParseDigestError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ParseDigestError::InvalidLength(len) => write!(
+                f,
+                "digest must be exactly 64 ASCII hexadecimal characters, got {len} bytes"
+            ),
+            ParseDigestError::InvalidHexChar(pos) => {
+                write!(f, "digest contains a non-hexadecimal byte at offset {pos}")
+            }
+        }
+    }
+}
+
+impl Error for ParseDigestError {}
+
+fn hex_nibble(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
+}
+
+impl std::str::FromStr for Sha256Digest {
+    type Err = ParseDigestError;
+
+    /// 从 64 个 ASCII 十六进制字符解析摘要。
+    ///
+    /// 接受 `0-9`、`a-f` 和 `A-F`，大小写混用表示同一个摘要。输入必须
+    /// 恰好是 64 个字符：不做任何裁剪或修正，空白、末尾换行、`0x` 前缀、
+    /// 分隔符以及全角数字等非 ASCII 内容都属于格式错误。长度按输入的
+    /// UTF-8 字节数判断，非法字符的位置也按字节偏移报告。
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let bytes = s.as_bytes();
+        if bytes.len() != 64 {
+            return Err(ParseDigestError::InvalidLength(bytes.len()));
+        }
+        let mut out = [0u8; 32];
+        for (i, pair) in bytes.chunks_exact(2).enumerate() {
+            let hi = hex_nibble(pair[0])
+                .ok_or(ParseDigestError::InvalidHexChar(2 * i))?;
+            let lo = hex_nibble(pair[1])
+                .ok_or(ParseDigestError::InvalidHexChar(2 * i + 1))?;
+            out[i] = (hi << 4) | lo;
+        }
+        Ok(Sha256Digest(out))
+    }
+}
+
 /// 计算摘要过程中读取输入失败时返回的类型化错误。
 #[derive(Debug)]
 pub struct DigestError(io::Error);
@@ -416,5 +498,163 @@ mod tests {
         assert_eq!(hex.len(), 64);
         assert!(hex.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
         assert!(!hex.chars().any(char::is_whitespace));
+    }
+
+    #[test]
+    fn digest_parses_back_from_its_own_hex() {
+        use std::str::FromStr;
+        let digest = digest_reader(&b"abc"[..]).unwrap();
+
+        // 标准字符串解析方式：str::parse 与 FromStr::from_str 等价。
+        let parsed: Sha256Digest = digest.to_hex().parse().unwrap();
+        assert_eq!(parsed, digest);
+        assert_eq!(Sha256Digest::from_str(&digest.to_hex()).unwrap(), digest);
+
+        // 解析结果的 32 字节与文本表示的值逐字节一致，
+        // 既有字节访问与显示功能直接可用。
+        assert_eq!(parsed.as_bytes(), digest.as_bytes());
+        assert_eq!(parsed.to_hex(), digest.to_hex());
+        assert_eq!(format!("{parsed}"), digest.to_hex());
+    }
+
+    #[test]
+    fn parsing_accepts_mixed_case_and_preserves_leading_zeros() {
+        use std::str::FromStr;
+        // 含前导零与大小写混用的已知摘要（SHA-256 of "The quick brown fox...")。
+        let lower = "d7a8fbb307d7809469ca9abcb0082e4f8d5651e46d3cdb762d02d0bf37c9e592";
+        let mixed = "D7a8FbB307d7809469CA9abCB0082E4f8D5651E46D3Cdb762D02d0BF37C9E592";
+        let from_lower = Sha256Digest::from_str(lower).unwrap();
+        let from_mixed: Sha256Digest = mixed.parse().unwrap();
+
+        // 大小写混用表示同一个摘要。
+        assert_eq!(from_lower, from_mixed);
+
+        // 前导零保留在字节值中，输出仍是 64 个小写十六进制字符。
+        let with_zero: Sha256Digest =
+            "00b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+                .parse()
+                .unwrap();
+        assert_eq!(with_zero.as_bytes()[0], 0x00);
+        assert_eq!(
+            with_zero.to_hex(),
+            "00b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+    }
+
+    #[test]
+    fn parse_rejects_wrong_length_and_reports_actual_length() {
+        use std::str::FromStr;
+        // 空字符串不能变成空文件的摘要。
+        let err = Sha256Digest::from_str("").unwrap_err();
+        assert_eq!(err, ParseDigestError::InvalidLength(0));
+        assert_eq!(err.actual_length(), Some(0));
+        assert_eq!(err.invalid_position(), None);
+
+        // 63 与 65 个字符都不接受。
+        assert_eq!(
+            Sha256Digest::from_str(
+                "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b85"
+            )
+            .unwrap_err(),
+            ParseDigestError::InvalidLength(63)
+        );
+        assert_eq!(
+            Sha256Digest::from_str(
+                "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b8550"
+            )
+            .unwrap_err(),
+            ParseDigestError::InvalidLength(65)
+        );
+
+        // 长度按 UTF-8 字节数判断：全角数字一个字符占 3 字节。
+        let fullwidth = "０".repeat(21); // 21 个字符，63 字节
+        let err = Sha256Digest::from_str(&fullwidth).unwrap_err();
+        assert_eq!(err, ParseDigestError::InvalidLength(63));
+        assert_eq!(err.actual_length(), Some(63));
+    }
+
+    #[test]
+    fn parse_rejects_non_hex_bytes_and_reports_first_byte_offset() {
+        use std::str::FromStr;
+        // 非法字符出现在偶数与奇数位置，位置从零开始按字节计。
+        let err = Sha256Digest::from_str(
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b85g",
+        )
+        .unwrap_err();
+        assert_eq!(err, ParseDigestError::InvalidHexChar(63));
+        assert_eq!(err.invalid_position(), Some(63));
+        assert_eq!(err.actual_length(), None);
+
+        let err = Sha256Digest::from_str(
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b8z5",
+        )
+        .unwrap_err();
+        assert_eq!(err, ParseDigestError::InvalidHexChar(62));
+
+        // 报告的是首个非法字节：后面的非法字符不影响位置。
+        let err = Sha256Digest::from_str(
+            "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz",
+        )
+        .unwrap_err();
+        assert_eq!(err, ParseDigestError::InvalidHexChar(0));
+
+        // 全角数字等非 ASCII 内容不作为十六进制字符接受；
+        // 位置按原始文本的字节偏移报告，不按字符个数。
+        // "e3" + "３"（3 字节）+ 59 个 '0'，共 64 字节，非法字节从偏移 2 开始。
+        let s = format!("e3３{}", "0".repeat(59));
+        assert_eq!(s.len(), 64);
+        let err = Sha256Digest::from_str(&s).unwrap_err();
+        assert_eq!(err, ParseDigestError::InvalidHexChar(2));
+    }
+
+    #[test]
+    fn parse_does_not_trim_or_fix_input() {
+        use std::str::FromStr;
+        let valid = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+
+        // 末尾换行、首尾空白、0x 前缀、分隔符都是格式错误（长度不符）。
+        for bad in [
+            format!("{valid}\n"),
+            format!(" {valid}"),
+            format!("{valid} "),
+            format!("0x{valid}"),
+            format!("{valid}\r\n"),
+        ] {
+            assert!(matches!(
+                Sha256Digest::from_str(&bad),
+                Err(ParseDigestError::InvalidLength(_))
+            ));
+        }
+
+        // 长度恰好 64 但含分隔符：按非法字符处理。
+        let with_dash = format!("{}-{}", &valid[..31], &valid[32..]);
+        assert_eq!(with_dash.len(), 64);
+        assert_eq!(
+            Sha256Digest::from_str(&with_dash).unwrap_err(),
+            ParseDigestError::InvalidHexChar(31)
+        );
+    }
+
+    #[test]
+    fn parse_error_supports_display_and_error_trait() {
+        use std::str::FromStr;
+        let len_err = Sha256Digest::from_str("abc").unwrap_err();
+        let msg = len_err.to_string();
+        assert!(msg.contains('3'), "unexpected message: {msg}");
+        assert!(msg.contains("64"), "unexpected message: {msg}");
+
+        let char_err = Sha256Digest::from_str(
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b85g",
+        )
+        .unwrap_err();
+        assert!(char_err.to_string().contains("63"));
+
+        // 两类错误可按类型区分，且都实现 std::error::Error，可常规传递。
+        fn assert_error<T: std::error::Error>(_: &T) {}
+        assert_error(&len_err);
+        assert_error(&char_err);
+        assert_ne!(len_err, char_err);
+        let boxed: Box<dyn std::error::Error> = Box::new(char_err);
+        assert!(boxed.to_string().contains("63"));
     }
 }
