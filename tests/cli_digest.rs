@@ -1120,3 +1120,482 @@ mod stderr_failures {
         }
     }
 }
+
+// ── 临时中断与短写之后的完整交付（Linux）────────────────────────────────────
+//
+// 既有测试覆盖了管道提前关闭、拒绝写入、部分送达后失败；本模块保障另一侧：
+// 只要接收方恢复接收，临时中断（EINTR）与一次只接收部分字节（短写）都不能
+// 造成结果缺失、重复或误报失败——最终交付的字节流与无中断时逐字节相同。
+//
+// 确定性注入靠 LD_PRELOAD shim（见 SHIM_SOURCE）：拦截子进程对 fd 1/2 的
+// write()，按脚本返回 EINTR、短写、零进展或不可恢复错误。真实管道无法
+// 制造这些条件（≤PIPE_BUF 的写是原子的，且子进程不装信号处理器时不会
+// 产生 EINTR），因此 shim 在测试运行时用 rustc 现场编译。
+#[cfg(target_os = "linux")]
+mod resumed_delivery {
+    use super::*;
+    use std::io;
+    use std::io::Read as _;
+    use std::os::raw::{c_int, c_void};
+    use std::os::unix::io::{FromRawFd, RawFd};
+    use std::process::Stdio;
+    use std::sync::OnceLock;
+    use std::time::{Duration, Instant};
+
+    unsafe extern "C" {
+        fn pipe2(pipefd: *mut RawFd, flags: c_int) -> c_int;
+        fn read(fd: RawFd, buf: *mut c_void, count: usize) -> isize;
+        fn close(fd: RawFd) -> c_int;
+        fn fcntl(fd: RawFd, cmd: c_int, arg: c_int) -> c_int;
+    }
+
+    /// LD_PRELOAD shim 的源码：按环境变量脚本驱动子进程对 fd 1/2 的 write()。
+    ///
+    /// 脚本经 INKSEAL_SHIM_SCRIPT_OUT / INKSEAL_SHIM_SCRIPT_ERR 传入，逗号
+    /// 分隔，每次 write 调用消耗一个记号：
+    ///   E    返回 -1，errno = EINTR（临时中断，之后仍可继续写入）
+    ///   s<N> 短写：只写入 N 字节并返回 N（一次只接收部分字节）
+    ///   Z    返回 0（尚有内容待写却毫无进展）
+    ///   B    返回 -1，errno = EIO（不可恢复的写入错误）
+    ///   N    原样透传（完整写入）
+    /// 脚本用完后一律透传。子进程是单线程的，静态计数器无需同步。
+    const SHIM_SOURCE: &str = r#"
+use std::ffi::{c_char, c_int, c_void};
+
+type WriteFn = unsafe extern "C" fn(c_int, *const c_void, usize) -> isize;
+
+const EINTR: c_int = 4;
+const EIO: c_int = 5;
+const RTLD_NEXT: *mut c_void = -1isize as *mut c_void;
+
+extern "C" {
+    fn dlsym(handle: *mut c_void, symbol: *const c_char) -> *mut c_void;
+    fn getenv(name: *const c_char) -> *mut c_char;
+    fn __errno_location() -> *mut c_int;
+}
+
+static mut REAL_WRITE: Option<WriteFn> = None;
+static mut SCRIPT_OUT: Option<Vec<u8>> = None;
+static mut SCRIPT_ERR: Option<Vec<u8>> = None;
+static mut IDX_OUT: usize = 0;
+static mut IDX_ERR: usize = 0;
+
+unsafe fn real_write() -> WriteFn {
+    if REAL_WRITE.is_none() {
+        let sym = dlsym(RTLD_NEXT, b"write\0".as_ptr().cast());
+        assert!(!sym.is_null(), "shim: cannot resolve real write");
+        REAL_WRITE = Some(std::mem::transmute::<*mut c_void, WriteFn>(sym));
+    }
+    REAL_WRITE.unwrap()
+}
+
+fn set_errno(value: c_int) {
+    unsafe { *__errno_location() = value }
+}
+
+unsafe fn script_for(fd: c_int) -> &'static [u8] {
+    let slot: *mut Option<Vec<u8>> = if fd == 1 { &mut SCRIPT_OUT } else { &mut SCRIPT_ERR };
+    if (*slot).is_none() {
+        let name: &[u8] = if fd == 1 {
+            b"INKSEAL_SHIM_SCRIPT_OUT\0"
+        } else {
+            b"INKSEAL_SHIM_SCRIPT_ERR\0"
+        };
+        let p = getenv(name.as_ptr().cast());
+        let mut script = Vec::new();
+        if !p.is_null() {
+            let mut len = 0;
+            while *p.add(len) != 0 {
+                len += 1;
+            }
+            script = std::slice::from_raw_parts(p.cast::<u8>(), len).to_vec();
+        }
+        *slot = Some(script);
+    }
+    (*slot).as_deref().unwrap()
+}
+
+unsafe fn next_token(fd: c_int) -> Option<String> {
+    let idx: &mut usize = if fd == 1 { &mut IDX_OUT } else { &mut IDX_ERR };
+    let script = script_for(fd);
+    if *idx >= script.len() {
+        return None;
+    }
+    let rest = &script[*idx..];
+    let take = rest.iter().position(|&b| b == b',').unwrap_or(rest.len());
+    let token = String::from_utf8_lossy(&rest[..take]).into_owned();
+    // 越过分隔逗号；末尾无逗号时越过结尾，下次调用返回 None。
+    *idx += take + 1;
+    Some(token)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn write(fd: c_int, buf: *const c_void, count: usize) -> isize {
+    let real = real_write();
+    if fd == 1 || fd == 2 {
+        if let Some(token) = next_token(fd) {
+            let token = token.trim();
+            if token == "E" {
+                set_errno(EINTR);
+                return -1;
+            }
+            if token == "Z" {
+                return 0;
+            }
+            if token == "B" {
+                set_errno(EIO);
+                return -1;
+            }
+            if let Some(n) = token.strip_prefix('s').and_then(|rest| rest.parse::<usize>().ok()) {
+                return real(fd, buf, n.min(count));
+            }
+            // "N" 或未识别记号：原样透传。
+        }
+    }
+    real(fd, buf, count)
+}
+"#;
+
+    /// 编译（每个测试进程一次）并返回 shim 共享库的路径。
+    fn shim_path() -> &'static Path {
+        static SHIM: OnceLock<PathBuf> = OnceLock::new();
+        SHIM.get_or_init(|| {
+            let dir = option_env!("CARGO_TARGET_TMPDIR")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| {
+                    std::env::temp_dir().join(format!("inkseal-shim-{}", std::process::id()))
+                });
+            fs::create_dir_all(&dir).expect("create shim dir");
+            let src = dir.join("write_shim.rs");
+            let so = dir.join("libinkseal_write_shim.so");
+            fs::write(&src, SHIM_SOURCE).expect("write shim source");
+            let rustc = std::env::var("RUSTC").unwrap_or_else(|_| "rustc".to_string());
+            let build = Command::new(rustc)
+                .args(["--edition", "2021", "--crate-type", "cdylib", "-O"])
+                .arg(&src)
+                .arg("-o")
+                .arg(&so)
+                .output()
+                .expect("run rustc to build the LD_PRELOAD shim");
+            assert!(
+                build.status.success(),
+                "shim build failed: {}",
+                String::from_utf8_lossy(&build.stderr)
+            );
+            so
+        })
+    }
+
+    /// 以 shim 脚本运行命令并等待结束。超过时限视为实现陷入空转（例如对
+    /// 零进展写入无限重试）：杀掉子进程并让测试失败，而不是挂住整个套件。
+    fn run_scripted(script_out: Option<&str>, script_err: Option<&str>, args: &[&OsStr]) -> Output {
+        let mut cmd = inkseal();
+        cmd.args(args).env("LD_PRELOAD", shim_path());
+        if let Some(script) = script_out {
+            cmd.env("INKSEAL_SHIM_SCRIPT_OUT", script);
+        }
+        if let Some(script) = script_err {
+            cmd.env("INKSEAL_SHIM_SCRIPT_ERR", script);
+        }
+        let mut child = cmd
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("failed to run inkseal");
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            if let Some(status) = child.try_wait().expect("try_wait") {
+                // 进程已结束：收齐两个流的全部字节。
+                let mut stdout = Vec::new();
+                let mut stderr = Vec::new();
+                child.stdout.take().unwrap().read_to_end(&mut stdout).unwrap();
+                child.stderr.take().unwrap().read_to_end(&mut stderr).unwrap();
+                return Output { status, stdout, stderr };
+            }
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("child did not exit within 30s (endless retry?), args={args:?}");
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    /// 与 src/main.rs 中 USAGE 加末尾换行一致的完整用法文本。
+    const USAGE_TEXT: &str = "Usage: inkseal --version\n       inkseal digest <file>\n       inkseal check-digest <file> <digest>\n";
+
+    #[test]
+    fn digest_line_intact_after_interleaved_interrupts_and_short_writes() {
+        let dir = TestDir::new("resume-digest");
+        let path = dir.write_file(OsStr::new("hello.txt"), b"abc");
+
+        // 连续中断、中断夹在短写之间、逐字节短写、脚本耗尽后透传：
+        // 最终交付必须与无中断时逐字节相同——每个字节恰好一次，
+        // 顺序不变，末尾换行不丢。
+        let output = run_scripted(
+            Some("E,s1,E,E,s7,s1,E,s13,s40"),
+            None,
+            &[OsStr::new("digest"), path.as_os_str()],
+        );
+
+        assert_eq!(output.status.code(), Some(0), "{output:?}");
+        assert_eq!(output.stdout, format!("{ABC_HEX}\n").as_bytes(), "{output:?}");
+        assert!(output.stderr.is_empty(), "{output:?}");
+    }
+
+    #[test]
+    fn ok_line_intact_after_interrupts_before_first_byte() {
+        let dir = TestDir::new("resume-ok");
+        let path = dir.write_file(OsStr::new("hello.txt"), b"abc");
+
+        // 第一个字节送出之前连续中断：中断不是输出结束。
+        let output = run_scripted(
+            Some("E,E,E,E"),
+            None,
+            &[
+                OsStr::new("check-digest"),
+                path.as_os_str(),
+                OsStr::new(ABC_HEX),
+            ],
+        );
+
+        assert_eq!(output.status.code(), Some(0), "{output:?}");
+        assert_eq!(output.stdout, b"OK\n", "{output:?}");
+        assert!(output.stderr.is_empty(), "{output:?}");
+    }
+
+    #[test]
+    fn version_line_intact_after_short_writes_and_interrupt() {
+        let output = run_scripted(Some("s1,s2,E,s3"), None, &[OsStr::new("--version")]);
+
+        assert_eq!(output.status.code(), Some(0), "{output:?}");
+        assert_eq!(output.stdout, b"inkseal 0.1.0\n", "{output:?}");
+        assert!(output.stderr.is_empty(), "{output:?}");
+    }
+
+    #[test]
+    fn usage_error_intact_after_interleaved_interrupts_and_short_writes() {
+        let output = run_scripted(None, Some("E,s5,E,E,s9,s1,E"), &[OsStr::new("digest")]);
+
+        // 用法提示完整交付后仍是退出码 2，标准输出为空。
+        assert_eq!(output.status.code(), Some(2), "{output:?}");
+        assert!(output.stdout.is_empty(), "{output:?}");
+        assert_eq!(output.stderr, USAGE_TEXT.as_bytes(), "{output:?}");
+    }
+
+    #[test]
+    fn invalid_digest_hint_intact_after_interleaved_interrupts_and_short_writes() {
+        let dir = TestDir::new("resume-bad-digest");
+        let missing = dir.path().join("does-not-exist");
+
+        let output = run_scripted(
+            None,
+            Some("s2,E,s11,E,s5"),
+            &[
+                OsStr::new("check-digest"),
+                missing.as_os_str(),
+                OsStr::new("abc"),
+            ],
+        );
+
+        let expected = format!(
+            "inkseal: invalid expected digest: \
+             expected digest must be exactly 64 ASCII hexadecimal characters, got 3\n\
+             {USAGE_TEXT}"
+        );
+        assert_eq!(output.status.code(), Some(2), "{output:?}");
+        assert!(output.stdout.is_empty(), "{output:?}");
+        assert_eq!(output.stderr, expected.as_bytes(), "{output:?}");
+    }
+
+    #[test]
+    fn cannot_open_hint_intact_after_interleaved_interrupts_and_short_writes() {
+        let dir = TestDir::new("resume-open");
+        let missing = dir.path().join("nope.txt");
+
+        let output = run_scripted(
+            None,
+            Some("s3,E,s8,E,E,s17"),
+            &[OsStr::new("digest"), missing.as_os_str()],
+        );
+
+        // 与无中断时完全一致的提示：同样的行结构、路径与系统原因。
+        let expected = format!(
+            "inkseal: cannot open '{}': {}\n",
+            missing.to_string_lossy(),
+            fs::File::open(&missing).unwrap_err()
+        );
+        assert_eq!(output.status.code(), Some(1), "{output:?}");
+        assert!(output.stdout.is_empty(), "{output:?}");
+        assert_eq!(output.stderr, expected.as_bytes(), "{output:?}");
+    }
+
+    #[test]
+    fn mismatch_hint_lists_each_digest_exactly_once_after_resume() {
+        let dir = TestDir::new("resume-mismatch");
+        let path = dir.write_file(OsStr::new("hello.txt"), b"abc");
+        let empty_hex = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+
+        let output = run_scripted(
+            None,
+            Some("E,s4,E,s6,E,s2,s100"),
+            &[
+                OsStr::new("check-digest"),
+                path.as_os_str(),
+                OsStr::new(empty_hex),
+            ],
+        );
+
+        // 多行提示完整交付：行结构、预期值与实际值都与无中断时一致。
+        let expected = format!(
+            "inkseal: digest mismatch for '{}'\nexpected: {empty_hex}\nactual:   {ABC_HEX}\n",
+            path.to_string_lossy()
+        );
+        assert_eq!(output.status.code(), Some(1), "{output:?}");
+        assert!(output.stdout.is_empty(), "{output:?}");
+        assert_eq!(output.stderr, expected.as_bytes(), "{output:?}");
+        // 预期值与实际值各出现恰好一次：续写不能重复已交付的开头。
+        let stderr = String::from_utf8(output.stderr.clone()).unwrap();
+        assert_eq!(stderr.matches(empty_hex).count(), 1, "{stderr:?}");
+        assert_eq!(stderr.matches(ABC_HEX).count(), 1, "{stderr:?}");
+    }
+
+    #[test]
+    fn unrecoverable_error_after_partial_success_prefix_exits_1() {
+        let dir = TestDir::new("resume-then-dead");
+        let path = dir.write_file(OsStr::new("hello.txt"), b"abc");
+        let line = format!("{ABC_HEX}\n");
+
+        // 前 10 个字节已交付，随后写入彻底失败：守住临时受阻与无法
+        // 继续之间的边界——已送出的前缀保留，不补发整行，结果不转移
+        // 到标准错误，退出码为 1。
+        let output = run_scripted(
+            Some("s10,B"),
+            None,
+            &[OsStr::new("digest"), path.as_os_str()],
+        );
+
+        assert_eq!(output.status.code(), Some(1), "{output:?}");
+        assert_eq!(output.stdout, line.as_bytes()[..10], "{output:?}");
+        let stderr = String::from_utf8(output.stderr.clone()).expect("stderr must be UTF-8");
+        assert!(
+            stderr.starts_with("inkseal: unable to write to standard output"),
+            "{stderr:?}"
+        );
+        assert!(
+            stderr.ends_with('\n') && !stderr[..stderr.len() - 1].contains('\n'),
+            "hint must be a single line: {stderr:?}"
+        );
+        assert!(!stderr.contains(ABC_HEX), "digest must not move to stderr: {stderr:?}");
+        assert!(!stderr.contains("panicked"), "must not crash: {stderr:?}");
+    }
+
+    #[test]
+    fn zero_progress_write_is_output_failure_not_endless_retry() {
+        let dir = TestDir::new("zero-progress");
+        let path = dir.write_file(OsStr::new("hello.txt"), b"abc");
+
+        // 尚有内容待写却返回零字节：按输出失败结束，不能无限等待。
+        // （若实现在此空转，run_scripted 的时限会让本测试失败而非挂住。）
+        let output = run_scripted(
+            Some("Z"),
+            None,
+            &[OsStr::new("digest"), path.as_os_str()],
+        );
+
+        assert_eq!(output.status.code(), Some(1), "{output:?}");
+        assert!(output.stdout.is_empty(), "{output:?}");
+        let stderr = String::from_utf8(output.stderr.clone()).expect("stderr must be UTF-8");
+        assert!(
+            stderr.starts_with("inkseal: unable to write to standard output"),
+            "{stderr:?}"
+        );
+        assert!(!stderr.contains("panicked"), "must not crash: {stderr:?}");
+    }
+
+    #[test]
+    fn zero_progress_on_usage_hint_keeps_exit_code_2() {
+        // 用法错误的提示自身写不出任何进展：仍以退出码 2 正常结束，
+        // 不崩溃、不改报、不把提示挪到标准输出。
+        let output = run_scripted(None, Some("Z"), &[OsStr::new("digest")]);
+
+        assert_eq!(output.status.code(), Some(2), "{output:?}");
+        assert!(output.stdout.is_empty(), "{output:?}");
+        assert!(output.stderr.is_empty(), "{output:?}");
+    }
+
+    #[test]
+    fn unrecoverable_error_mid_hint_keeps_partial_hint_and_exit_code() {
+        let dir = TestDir::new("hint-then-dead");
+        let missing = dir.path().join("nope.txt");
+
+        // 提示送出 6 个字节后写入彻底失败：已送出的前缀保留，不补齐、
+        // 不重试，退出码仍是原操作的 1，进程正常结束。
+        let output = run_scripted(
+            None,
+            Some("s6,B"),
+            &[OsStr::new("digest"), missing.as_os_str()],
+        );
+
+        assert_eq!(output.status.code(), Some(1), "{output:?}");
+        assert!(output.stdout.is_empty(), "{output:?}");
+        assert_eq!(output.stderr, b"inksea", "{output:?}");
+    }
+
+    /// 不借助 shim 的真实管道场景：提示远超管道容量，接收方缓慢但持续地
+    /// 读取——子进程写满容量后阻塞，接收方每取走一段，子进程续写一段，
+    /// 最终交付的提示必须与无阻塞时逐字节相同。
+    #[test]
+    fn long_hint_fully_delivered_through_slowly_drained_pipe() {
+        const F_SETPIPE_SZ: c_int = 1024 + 7;
+        // arm64/x86-64 Linux 上 O_CLOEXEC 均为 02000000（八进制）。
+        const O_CLOEXEC: c_int = 0o2000000;
+
+        let dir = TestDir::new("resume-long-hint");
+        // 单条错误提示远超 PIPE_BUF（4096）：含约 10000 字节的路径名。
+        let path = dir.path().join("A".repeat(10_000));
+
+        // pipe2(…, O_CLOEXEC)：读端不能被子进程继承（同既有部分送达测试）。
+        let mut fds: [RawFd; 2] = [-1, -1];
+        assert_eq!(
+            unsafe { pipe2(fds.as_mut_ptr(), O_CLOEXEC) },
+            0,
+            "{}",
+            io::Error::last_os_error()
+        );
+        let set = unsafe { fcntl(fds[1], F_SETPIPE_SZ, 4096) };
+        assert!(set >= 0, "shrink pipe: {}", io::Error::last_os_error());
+
+        let write_end = unsafe { std::fs::File::from_raw_fd(fds[1]) };
+        let child = inkseal()
+            .args(["digest"])
+            .arg(path.as_os_str())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::from(write_end))
+            .spawn()
+            .expect("failed to run inkseal");
+
+        // 缓慢但持续地读到 EOF：每次只取一小段，让子进程反复阻塞-续写。
+        let mut delivered = Vec::new();
+        let mut buf = [0u8; 997];
+        loop {
+            let n = unsafe { read(fds[0], buf.as_mut_ptr().cast::<c_void>(), buf.len()) };
+            assert!(n >= 0, "read pipe: {}", io::Error::last_os_error());
+            if n == 0 {
+                break;
+            }
+            delivered.extend_from_slice(&buf[..n as usize]);
+        }
+        assert_eq!(unsafe { close(fds[0]) }, 0);
+
+        let output = child.wait_with_output().expect("failed to wait");
+        let expected = format!(
+            "inkseal: cannot open '{}': {}\n",
+            path.to_string_lossy(),
+            fs::File::open(&path).unwrap_err()
+        );
+        assert_eq!(output.status.code(), Some(1), "{output:?}");
+        assert!(output.stdout.is_empty(), "{output:?}");
+        assert_eq!(delivered, expected.as_bytes());
+    }
+}
