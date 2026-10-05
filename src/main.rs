@@ -3,7 +3,7 @@ use std::env;
 use std::ffi::OsStr;
 use std::fs::File;
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 const USAGE: &str = "Usage: inkseal --version\n       inkseal digest <file>\n       inkseal check-digest <file> <digest>";
@@ -42,29 +42,53 @@ fn main() -> ExitCode {
     }
 }
 
-fn run_digest(path: &Path) -> ExitCode {
-    // 仅在输出错误信息时做损失性转换；打开文件始终使用原始路径，
-    // 绝不把用于显示的文字当作实际路径访问。
-    let display = path_display(path);
-    let file = match File::open(path) {
-        Ok(file) => file,
-        Err(err) => {
-            return emit_error(
-                1,
-                format!("inkseal: cannot open '{display}': {err}\n").as_bytes(),
-            );
+/// 打开 `path` 并以流式方式读取其全部内容，返回完整摘要。
+///
+/// 这是 `digest` 与 `check-digest` 共用的唯一文件访问规则：始终以操作
+/// 系统给出的原始路径打开文件（用于显示的文字绝不参与访问），以原始
+/// 字节流式计算摘要——空文件、二进制内容与各种换行形式都按同一条规则
+/// 处理，内存占用与文件大小无关。文件打不开与读取中途失败是两类不同的
+/// 失败（见 [`FileAccessError`]）；即使已读入一部分内容，读取失败也绝不
+/// 返回部分摘要。
+fn digest_file(path: &Path) -> Result<Sha256Digest, FileAccessError> {
+    let file = File::open(path)
+        .map_err(|err| FileAccessError::Open(path.to_path_buf(), err))?;
+    inkseal::digest_reader(file)
+        .map_err(|err| FileAccessError::Read(path.to_path_buf(), err))
+}
+
+/// 读取单个文件计算完整摘要时的失败，区分“打不开”与“读取中途失败”,
+/// 以便两条命令共用同一套提示规则。
+enum FileAccessError {
+    /// 文件无法打开；携带原始路径与系统给出的原因。
+    Open(PathBuf, io::Error),
+    /// 文件已打开但读取中途失败；已读入的部分内容不产生任何摘要。
+    Read(PathBuf, inkseal::DigestError),
+}
+
+impl FileAccessError {
+    /// 渲染为既有的单行错误提示（含末尾换行）：仅在此时把路径做损失性
+    /// 转换并转义控制字符，显示文字不影响也不回溯到实际访问对象。
+    fn message(&self) -> String {
+        match self {
+            FileAccessError::Open(path, err) => {
+                format!("inkseal: cannot open '{}': {err}\n", path_display(path))
+            }
+            FileAccessError::Read(path, err) => {
+                format!("inkseal: cannot read '{}': {err}\n", path_display(path))
+            }
         }
-    };
-    match inkseal::digest_reader(file) {
+    }
+}
+
+fn run_digest(path: &Path) -> ExitCode {
+    match digest_file(path) {
         Ok(digest) => {
             let mut line = digest.to_hex();
             line.push('\n');
             emit_success(line.as_bytes())
         }
-        Err(err) => emit_error(
-            1,
-            format!("inkseal: cannot read '{display}': {err}\n").as_bytes(),
-        ),
+        Err(err) => emit_error(1, err.message().as_bytes()),
     }
 }
 
@@ -221,26 +245,11 @@ fn run_check_digest(path: &Path, expected_arg: &OsStr) -> ExitCode {
         }
     };
 
-    // 仅在输出错误信息时做损失性转换；打开文件始终使用原始路径，
-    // 绝不把用于显示的文字当作实际路径访问。
-    let display = path_display(path);
-    let file = match File::open(path) {
-        Ok(file) => file,
-        Err(err) => {
-            return emit_error(
-                1,
-                format!("inkseal: cannot open '{display}': {err}\n").as_bytes(),
-            );
-        }
-    };
-    let actual = match inkseal::digest_reader(file) {
+    // 与 digest 共用同一条文件访问规则；访问失败是文件问题，
+    // 绝不能被解释成内容不匹配。
+    let actual = match digest_file(path) {
         Ok(digest) => digest,
-        Err(err) => {
-            return emit_error(
-                1,
-                format!("inkseal: cannot read '{display}': {err}\n").as_bytes(),
-            );
-        }
+        Err(err) => return emit_error(1, err.message().as_bytes()),
     };
 
     if actual == expected {
@@ -251,9 +260,10 @@ fn run_check_digest(path: &Path, expected_arg: &OsStr) -> ExitCode {
         emit_error(
             1,
             format!(
-                "inkseal: digest mismatch for '{display}'\n\
+                "inkseal: digest mismatch for '{}'\n\
                  expected: {}\n\
                  actual:   {}\n",
+                path_display(path),
                 expected.to_hex(),
                 actual.to_hex()
             )
