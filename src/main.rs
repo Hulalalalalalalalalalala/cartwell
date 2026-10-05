@@ -2,6 +2,7 @@ use inkseal::{ParseDigestError, Sha256Digest};
 use std::env;
 use std::ffi::OsStr;
 use std::fs::File;
+use std::io::{self, Write};
 use std::path::Path;
 use std::process::ExitCode;
 
@@ -13,8 +14,7 @@ fn main() -> ExitCode {
     let mut args = env::args_os().skip(1);
     match args.next() {
         Some(ref cmd) if cmd.as_encoded_bytes() == b"--version" && args.next().is_none() => {
-            println!("inkseal 0.1.0");
-            ExitCode::SUCCESS
+            emit_success(b"inkseal 0.1.0\n")
         }
         Some(ref cmd) if cmd.as_encoded_bytes() == b"digest" => {
             let (Some(path), None) = (args.next(), args.next()) else {
@@ -52,14 +52,92 @@ fn run_digest(path: &Path) -> ExitCode {
     };
     match inkseal::digest_reader(file) {
         Ok(digest) => {
-            println!("{}", digest.to_hex());
-            ExitCode::SUCCESS
+            let mut line = digest.to_hex();
+            line.push('\n');
+            emit_success(line.as_bytes())
         }
         Err(err) => {
             eprintln!("inkseal: cannot read '{display}': {err}");
             ExitCode::FAILURE
         }
     }
+}
+
+/// 把成功结果一次性完整写到标准输出并立即刷出，返回进程退出码。
+///
+/// 成功的含义是**整行结果（含末尾换行）已经真正交到输出端**：仅算出
+/// 摘要或通过比较并不构成成功，写中途失败或最后的刷新失败（例如标准
+/// 输出被重定向到只读位置，或管道接收方提前关闭）都必须以退出码 1
+/// 结束，而不是让 `println!` 的 panic 打印崩溃信息，也不能照常报成功。
+///
+/// 输出失败时只在标准错误给出一条以 `inkseal:` 开头的单行提示，保留
+/// 系统给出的具体原因；不补充用法说明，不把摘要改写到标准错误，也不
+/// 重试整行输出。标准输出此前可能已经收到结果的前几个字节，这些字节
+/// 无法也不必撤回。若连这条提示都写不出去，同样静默地以退出码 1
+/// 结束——报告输出失败的过程自身绝不能再崩溃。
+fn emit_success(line: &[u8]) -> ExitCode {
+    match write_stdout_all(line) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(err) => {
+            // 直接走 Write trait 写原始字节，不经过会因写失败而 panic 的宏；
+            // 提示本身写不出去也忽略，只需保证退出码为 1。
+            let stderr = io::stderr();
+            let mut err_handle = stderr.lock();
+            let _ = writeln!(
+                err_handle,
+                "inkseal: unable to write to standard output: {err}"
+            );
+            let _ = err_handle.flush();
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// 直接对标准输出的原始文件描述符发起 `write`，绕过标准库 `Stdout`
+/// 对“输出端不存在/拒绝写入”这类失败的特殊处理——它在某些情况下会把
+/// 失败（如 fd 以只读方式打开时内核返回的 EBADF）静默报告为成功，导致
+/// 调用方误以为结果已交付。短写照常续写到同一 fd；EINTR 立即重试。
+#[cfg(unix)]
+fn write_stdout_all(mut line: &[u8]) -> io::Result<()> {
+    use std::os::raw::c_void;
+    use std::os::fd::RawFd;
+
+    unsafe extern "C" {
+        fn write(fd: RawFd, buf: *const c_void, count: usize) -> isize;
+    }
+
+    const STDOUT_FD: RawFd = 1;
+    while !line.is_empty() {
+        let written = unsafe { write(STDOUT_FD, line.as_ptr().cast::<c_void>(), line.len()) };
+        if written < 0 {
+            let err = io::Error::last_os_error();
+            // 临时中断不代表任何字节的命运，原地重试。
+            if err.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(err);
+        }
+        let n = written as usize;
+        if n == 0 {
+            // 对正数计数的 write 返回 0 没有可恢复的含义，按写出失败处理，
+            // 避免在此空转。
+            return Err(io::Error::new(
+                io::ErrorKind::WriteZero,
+                "write to standard output returned no progress",
+            ));
+        }
+        line = &line[n..];
+    }
+    Ok(())
+}
+
+/// 非 Unix 目标：标准库句柄不存在上述特殊处理，沿用加锁写入并显式刷新。
+#[cfg(not(unix))]
+fn write_stdout_all(line: &[u8]) -> io::Result<()> {
+    let stdout = io::stdout();
+    let mut handle = stdout.lock();
+    handle.write_all(line)?;
+    handle.flush()
 }
 
 /// 解析用户给出的预期摘要。
@@ -112,8 +190,7 @@ fn run_check_digest(path: &Path, expected_arg: &OsStr) -> ExitCode {
     };
 
     if actual == expected {
-        println!("OK");
-        ExitCode::SUCCESS
+        emit_success(b"OK\n")
     } else {
         // 内容不匹配：预期与实际都用库的同一显示规则呈现为
         // 64 个小写十六进制字符（大小写混用的输入也规范为小写）。

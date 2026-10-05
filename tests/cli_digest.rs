@@ -631,3 +631,180 @@ fn check_digest_non_utf8_digest_argument_is_usage_error_without_opening_file() {
     let stderr = assert_usage_error(&output);
     assert!(!stderr.contains("cannot open"), "{stderr:?}");
 }
+
+// ── 标准输出写入失败 ─────────────────────────────────────────────────────────
+
+#[cfg(unix)]
+mod output_failures {
+    use super::*;
+    use std::fs::OpenOptions;
+    use std::os::unix::io::{FromRawFd, RawFd};
+    use std::process::Stdio;
+
+    unsafe extern "C" {
+        fn pipe(pipefd: *mut RawFd) -> std::os::raw::c_int;
+    }
+
+    /// 构造一个读端已经关闭的管道写端：子进程一写标准输出就收到 EPIPE，
+    /// 模拟“结果交给管道而接收方已提前关闭”。
+    fn closed_pipe_stdout() -> Stdio {
+        let mut fds: [RawFd; 2] = [-1, -1];
+        assert_eq!(unsafe { pipe(fds.as_mut_ptr()) }, 0);
+        // 读端立即关闭（File 析构关闭该 fd）。
+        drop(unsafe { std::fs::File::from_raw_fd(fds[0]) });
+        Stdio::from(unsafe { std::fs::File::from_raw_fd(fds[1]) })
+    }
+
+    /// 以读不开写方式打开一个普通文件得到的 fd：对它写入会被内核拒绝，
+    /// 模拟“标准输出被重定向到拒绝写入的位置”。
+    fn read_only_stdout(path: &Path) -> Stdio {
+        let file = OpenOptions::new()
+            .read(true)
+            .write(false)
+            .open(path)
+            .expect("open read-only fd");
+        Stdio::from(file)
+    }
+
+    fn run_with_stdout(stdout: Stdio, args: &[&OsStr]) -> Output {
+        inkseal()
+            .args(args)
+            .stdout(stdout)
+            .output()
+            .expect("failed to run inkseal")
+    }
+
+    /// 输出失败的完整约定：退出码 1、标准输出为空、标准错误只有一条
+    /// inkseal: 的写入失败提示（保留系统原因），没有任何崩溃信息。
+    fn assert_output_failure(output: &Output) -> String {
+        assert_eq!(output.status.code(), Some(1), "exit code: {output:?}");
+        assert!(
+            output.stdout.is_empty(),
+            "captured stdout must be empty: {:?}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        let stderr = String::from_utf8(output.stderr.clone()).expect("stderr must be UTF-8");
+        assert!(
+            stderr.starts_with("inkseal: unable to write to standard output"),
+            "must report an output failure, not another error: {stderr:?}"
+        );
+        assert!(
+            stderr.ends_with('\n') && !stderr[..stderr.len() - 1].contains('\n'),
+            "hint must be a single line: {stderr:?}"
+        );
+        // 系统给出的具体原因必须保留，且不能是 Rust 崩溃信息。
+        assert!(!stderr.contains("panicked"), "must not crash: {stderr:?}");
+        stderr
+    }
+
+    #[test]
+    fn version_write_failure_exits_1_without_panic() {
+        let output = run_with_stdout(closed_pipe_stdout(), &[OsStr::new("--version")]);
+
+        let stderr = assert_output_failure(&output);
+        assert!(stderr.to_lowercase().contains("pipe"), "keep OS reason: {stderr:?}");
+    }
+
+    #[test]
+    fn digest_computed_but_not_delivered_is_still_a_failure() {
+        let dir = TestDir::new("digest-dead-pipe");
+        let path = dir.write_file(OsStr::new("hello.txt"), b"abc");
+
+        let output = run_with_stdout(
+            closed_pipe_stdout(),
+            &[OsStr::new("digest"), path.as_os_str()],
+        );
+
+        let stderr = assert_output_failure(&output);
+        // 不能把输出问题误报成读文件问题，也不能把摘要写到标准错误。
+        assert!(!stderr.contains("cannot read"), "{stderr:?}");
+        assert!(!stderr.contains(ABC_HEX), "digest must not move to stderr: {stderr:?}");
+    }
+
+    #[test]
+    fn check_digest_match_but_not_delivered_is_still_a_failure() {
+        let dir = TestDir::new("check-dead-pipe");
+        let path = dir.write_file(OsStr::new("hello.txt"), b"abc");
+
+        let output = run_with_stdout(
+            closed_pipe_stdout(),
+            &[
+                OsStr::new("check-digest"),
+                path.as_os_str(),
+                OsStr::new(ABC_HEX),
+            ],
+        );
+
+        let stderr = assert_output_failure(&output);
+        // 不能补写成功标记，也不能误报为不匹配。
+        assert!(!stderr.to_lowercase().contains("mismatch"), "{stderr:?}");
+        assert!(!stderr.contains("OK"), "must not echo success marker to stderr: {stderr:?}");
+    }
+
+    #[test]
+    fn redirect_to_unwritable_destination_is_output_failure() {
+        let dir = TestDir::new("stdout-readonly");
+        let target = dir.write_file(OsStr::new("sink"), b"");
+
+        let output = run_with_stdout(
+            read_only_stdout(&target),
+            &[OsStr::new("--version")],
+        );
+
+        // 只读 fd 上的写入同样是输出失败，而非崩溃或成功。
+        assert_output_failure(&output);
+    }
+
+    #[test]
+    fn failure_branches_are_not_reported_as_output_errors_when_stdout_dead() {
+        let dir = TestDir::new("dead-stdout-failures");
+        let file = dir.write_file(OsStr::new("hello.txt"), b"abc");
+        let missing = dir.path().join("nope.txt");
+        let empty_hex = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+
+        // 参数错误仍是退出码 2 与用法提示。
+        let usage = run_with_stdout(closed_pipe_stdout(), &[OsStr::new("digest")]);
+        assert_eq!(usage.status.code(), Some(2), "{usage:?}");
+        let stderr = String::from_utf8_lossy(&usage.stderr);
+        assert!(stderr.contains("Usage:"), "{stderr:?}");
+        assert!(!stderr.contains("unable to write to standard output"), "{stderr:?}");
+
+        // 摘要格式错误仍是退出码 2，且不访问文件。
+        let bad_digest = run_with_stdout(
+            closed_pipe_stdout(),
+            &[
+                OsStr::new("check-digest"),
+                missing.as_os_str(),
+                OsStr::new("abc"),
+            ],
+        );
+        assert_eq!(bad_digest.status.code(), Some(2), "{bad_digest:?}");
+        let stderr = String::from_utf8_lossy(&bad_digest.stderr);
+        assert!(stderr.contains("Usage:"), "{stderr:?}");
+        assert!(!stderr.contains("unable to write to standard output"), "{stderr:?}");
+
+        // 文件打不开仍是退出码 1 与 cannot open，不是输出错误。
+        let open_fail = run_with_stdout(
+            closed_pipe_stdout(),
+            &[OsStr::new("digest"), missing.as_os_str()],
+        );
+        assert_eq!(open_fail.status.code(), Some(1), "{open_fail:?}");
+        let stderr = assert_failure(&open_fail);
+        assert!(stderr.contains("cannot open"), "{stderr:?}");
+        assert!(!stderr.contains("unable to write to standard output"), "{stderr:?}");
+
+        // 内容不匹配仍按不匹配报告：没有成功结果需要写出，
+        // 不应仅因标准输出不可用而变成输出错误。
+        let mismatch = run_with_stdout(
+            closed_pipe_stdout(),
+            &[
+                OsStr::new("check-digest"),
+                file.as_os_str(),
+                OsStr::new(empty_hex),
+            ],
+        );
+        assert_mismatch(&mismatch, empty_hex, ABC_HEX);
+        let stderr = String::from_utf8_lossy(&mismatch.stderr);
+        assert!(!stderr.contains("unable to write to standard output"), "{stderr:?}");
+    }
+}
