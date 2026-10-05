@@ -72,15 +72,20 @@ impl From<io::Error> for DigestError {
 /// 以流式方式读取 `reader` 的全部字节并计算 SHA-256 摘要。
 ///
 /// 内存占用与输入大小无关。读取失败时返回 [`DigestError`]，绝不返回部分内容的摘要。
+///
+/// [`io::ErrorKind::Interrupted`] 是临时中断而非输入结束：本次读取没有
+/// 消费任何字节，直接重试同一位置，摘要与未发生中断时完全一致。其他
+/// 错误（权限不足、数据损坏等）仍然立即失败。
 pub fn digest_reader<R: Read>(mut reader: R) -> Result<Sha256Digest, DigestError> {
     let mut hasher = Sha256::new();
     let mut buf = [0u8; 64 * 1024];
     loop {
-        let n = reader.read(&mut buf)?;
-        if n == 0 {
-            break;
+        match reader.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => hasher.update(&buf[..n]),
+            Err(ref err) if err.kind() == io::ErrorKind::Interrupted => continue,
+            Err(err) => return Err(DigestError(err)),
         }
-        hasher.update(&buf[..n]);
     }
     Ok(Sha256Digest(hasher.finalize().into()))
 }
@@ -214,6 +219,139 @@ mod tests {
             digest.to_hex(),
             "879e1d6af3829ebad59012630ce80b422b1bf81dbdc2bc0c1ba940f46f2dde3c"
         );
+    }
+
+    /// 按脚本驱动的读取器：每个步骤要么返回下一段内容（长度可短于缓冲区），
+    /// 要么返回一个错误。脚本用完后继续返回剩余内容，内容耗尽后返回 Ok(0)。
+    /// 用于精确模拟“中断出现在任意位置”的读取序列。
+    enum Step {
+        /// 返回下一段内容（可为空切片以外的任意长度）。
+        Data,
+        /// 返回指定错误。
+        Fail(io::ErrorKind, &'static str),
+    }
+
+    struct ScriptedReader<'a> {
+        data: &'a [u8],
+        pos: usize,
+        steps: &'a [Step],
+        step_index: usize,
+    }
+
+    impl<'a> ScriptedReader<'a> {
+        fn new(data: &'a [u8], steps: &'a [Step]) -> Self {
+            ScriptedReader { data, pos: 0, steps, step_index: 0 }
+        }
+    }
+
+    impl Read for ScriptedReader<'_> {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            match self.steps.get(self.step_index) {
+                Some(Step::Data) => {
+                    self.step_index += 1;
+                    // 每段最多给剩余内容的一半，保证一段脚本可能对应多次内容返回，
+                    // 且片段长度通常短于缓冲区容量。
+                    let remaining = self.data.len() - self.pos;
+                    let n = (remaining / 2).max(1).min(remaining).min(buf.len());
+                    buf[..n].copy_from_slice(&self.data[self.pos..self.pos + n]);
+                    self.pos += n;
+                    Ok(n)
+                }
+                Some(Step::Fail(kind, msg)) => {
+                    self.step_index += 1;
+                    Err(io::Error::new(*kind, *msg))
+                }
+                None => {
+                    let remaining = self.data.len() - self.pos;
+                    let n = remaining.min(buf.len());
+                    buf[..n].copy_from_slice(&self.data[self.pos..self.pos + n]);
+                    self.pos += n;
+                    Ok(n)
+                }
+            }
+        }
+    }
+
+    use Step::{Data, Fail};
+
+    #[test]
+    fn interrupted_reads_are_retried_not_treated_as_eof_or_error() {
+        let data = long_input();
+        let expected = digest_reader(&data[..]).unwrap();
+
+        // 第一个字节之前中断。
+        let before_first = digest_reader(ScriptedReader::new(
+            &data,
+            &[Fail(io::ErrorKind::Interrupted, "EINTR"), Data, Data, Data, Data, Data, Data],
+        ))
+        .unwrap();
+        // 中断夹在两段有效内容之间。
+        let between = digest_reader(ScriptedReader::new(
+            &data,
+            &[Data, Fail(io::ErrorKind::Interrupted, "EINTR"), Data, Data, Data],
+        ))
+        .unwrap();
+        // 最后一段内容之后、输入正式结束之前中断。
+        let before_eof = digest_reader(ScriptedReader::new(
+            &data,
+            &[Data, Data, Data, Data, Data, Data, Fail(io::ErrorKind::Interrupted, "EINTR")],
+        ))
+        .unwrap();
+        // 连续多次中断。
+        let repeated = digest_reader(ScriptedReader::new(
+            &data,
+            &[
+                Fail(io::ErrorKind::Interrupted, "EINTR"),
+                Fail(io::ErrorKind::Interrupted, "EINTR"),
+                Data,
+                Fail(io::ErrorKind::Interrupted, "EINTR"),
+                Fail(io::ErrorKind::Interrupted, "EINTR"),
+                Data,
+                Data,
+                Data,
+                Data,
+                Fail(io::ErrorKind::Interrupted, "EINTR"),
+                Fail(io::ErrorKind::Interrupted, "EINTR"),
+            ],
+        ))
+        .unwrap();
+
+        for digest in [before_first, between, before_eof, repeated] {
+            assert_eq!(digest, expected);
+        }
+        // 结果仍对应整份原始字节。
+        assert_eq!(expected.to_hex(), LONG_INPUT_HEX);
+    }
+
+    #[test]
+    fn interrupted_empty_input_still_yields_empty_digest() {
+        // 只有中断、没有任何内容：与无中断的空输入摘要一致。
+        let digest = digest_reader(ScriptedReader::new(
+            b"",
+            &[Fail(io::ErrorKind::Interrupted, "EINTR"), Fail(io::ErrorKind::Interrupted, "EINTR")],
+        ))
+        .unwrap();
+        assert_eq!(digest, digest_reader(io::empty()).unwrap());
+    }
+
+    #[test]
+    fn non_interrupted_error_after_interrupt_still_fails() {
+        const PREFIX: &[u8] = b"partial bytes before the failure";
+        // 先发生可恢复的临时中断，随后出现真正的读取错误：
+        // 本次调用必须失败，且报告的是后来的真实错误，不是之前的中断。
+        let err = digest_reader(ScriptedReader::new(
+            PREFIX,
+            &[
+                Fail(io::ErrorKind::Interrupted, "EINTR"),
+                Data,
+                Fail(io::ErrorKind::PermissionDenied, "disk vanished"),
+            ],
+        ))
+        .unwrap_err();
+
+        let inner = err.into_inner();
+        assert_eq!(inner.kind(), io::ErrorKind::PermissionDenied);
+        assert!(inner.to_string().contains("disk vanished"));
     }
 
     #[test]
