@@ -1121,6 +1121,433 @@ mod stderr_failures {
     }
 }
 
+// ── 读取临时受阻后继续（EINTR 与短读）与部分读取后失败 ─────────────────────────
+//
+// check-digest 打开文件后，读取循环必须持续到明确读到文件结束：一次 read
+// 只返回少量字节（短读）不是结束，可恢复的临时中断（EINTR，一个字节都没
+// 读到）也不是结束，二者都必须在原位置继续；只有 read 明确返回 0 才是
+// 结束。若已读入部分内容后出现真正的读取错误，这是读取失败：退出码 1、
+// 标准输出为空、沿用 `cannot read` 提示并给出路径与具体原因，绝不能因为
+// “已经读到的前缀摘要恰好等于预期摘要”而报 OK，也不能退化为不匹配。
+//
+// 与输出侧重试相同，这类读取序列无法从父进程一侧确定性地制造，因此用
+// LD_PRELOAD 垫片拦截子进程的 read，按 INKSEAL_READ_SHIM 给出的逗号分隔
+// 脚本逐步注入临时中断、短读与不可恢复错误，脚本耗尽后透传真实读取。
+#[cfg(target_os = "linux")]
+mod read_retry {
+    use super::*;
+    use std::sync::OnceLock;
+
+    /// LD_PRELOAD 垫片源码：拦截子进程对已打开输入文件（fd 3 及以上）的
+    /// read 调用，按 INKSEAL_READ_SHIM 的逗号分隔脚本逐步执行，脚本耗尽
+    /// 后透传真实读取。步骤：`i` = 返回 EINTR（不读到任何字节）；
+    /// `sN` = 最多读取 N 字节的短读；`eN` = 返回 errno 为 N 的真实错误。
+    ///
+    /// 垫片自身读取时直接走 read 系统调用，绕开对 read 符号的拦截，否则
+    /// 透传分支会递归进入自己。垫片不引入任何 crate 依赖，测试运行时用
+    /// rustc 编译为 cdylib。
+    const SHIM_SOURCE: &str = r#"
+use std::os::raw::{c_int, c_void};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::OnceLock;
+
+#[derive(Clone, Copy)]
+enum Step {
+    Intr,
+    Short(usize),
+    Errno(c_int),
+}
+
+fn steps() -> &'static [Step] {
+    static STEPS: OnceLock<Vec<Step>> = OnceLock::new();
+    STEPS
+        .get_or_init(|| {
+            std::env::var("INKSEAL_READ_SHIM")
+                .unwrap_or_default()
+                .split(',')
+                .filter(|token| !token.is_empty())
+                .map(|token| {
+                    if token == "i" {
+                        Step::Intr
+                    } else if let Some(n) = token.strip_prefix('s') {
+                        Step::Short(n.parse().expect("short-read length"))
+                    } else if let Some(e) = token.strip_prefix('e') {
+                        Step::Errno(e.parse().expect("errno"))
+                    } else {
+                        panic!("unknown shim step: {token}");
+                    }
+                })
+                .collect()
+        })
+        .as_slice()
+}
+
+static STEP_INDEX: AtomicUsize = AtomicUsize::new(0);
+
+unsafe extern "C" {
+    fn syscall(number: isize, ...) -> isize;
+    fn __errno_location() -> *mut c_int;
+}
+
+#[cfg(target_arch = "x86_64")]
+const SYS_READ: isize = 0;
+#[cfg(target_arch = "aarch64")]
+const SYS_READ: isize = 63;
+
+const EINTR: c_int = 4;
+
+fn fail(errno: c_int) -> isize {
+    unsafe { *__errno_location() = errno };
+    -1
+}
+
+fn real_read(fd: c_int, buf: *mut c_void, count: usize) -> isize {
+    // 直接发起 read 系统调用：不能调用 libc 的 read，否则会被本垫片
+    // 再次拦截而无限递归。
+    unsafe { syscall(SYS_READ, fd, buf, count) }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn read(fd: c_int, buf: *mut c_void, count: usize) -> isize {
+    // 只驱动被核对的输入文件：子进程的标准描述符固定为 0–2，命令打开
+    // 文件后得到 fd 3。脚本耗尽后一律透传，启动阶段即便存在其他读取
+    // （已确认本进程没有）也不会受到影响。
+    if fd >= 3 {
+        let index = STEP_INDEX.fetch_add(1, Ordering::SeqCst);
+        match steps().get(index) {
+            Some(Step::Intr) => return fail(EINTR),
+            Some(Step::Errno(errno)) => return fail(*errno),
+            Some(Step::Short(limit)) => return real_read(fd, buf, count.min(*limit)),
+            None => {}
+        }
+    }
+    real_read(fd, buf, count)
+}
+"#;
+
+    /// Linux 上各架构一致的 errno 值。
+    const EIO: i32 = 5;
+    const EACCES: i32 = 13;
+
+    /// errno 5（EIO）经标准库显示的具体原因。
+    const EIO_REASON: &str = "Input/output error (os error 5)";
+    /// errno 13（EACCES）经标准库显示的具体原因。
+    const EACCES_REASON: &str = "Permission denied (os error 13)";
+
+    /// 每个测试进程只编译一次垫片，产物放在临时目录。
+    fn read_shim() -> &'static Path {
+        static SHIM: OnceLock<PathBuf> = OnceLock::new();
+        SHIM.get_or_init(|| {
+            let dir = std::env::temp_dir()
+                .join(format!("inkseal-read-shim-{}", std::process::id()));
+            fs::create_dir_all(&dir).expect("create shim dir");
+            let source = dir.join("read_shim.rs");
+            let library = dir.join("libinkseal_read_shim.so");
+            fs::write(&source, SHIM_SOURCE).expect("write shim source");
+            let rustc = std::env::var_os("RUSTC").unwrap_or_else(|| "rustc".into());
+            let status = Command::new(rustc)
+                .arg("--edition=2021")
+                .arg("--crate-type=cdylib")
+                .arg("-O")
+                .arg("-o")
+                .arg(&library)
+                .arg(&source)
+                .status()
+                .expect("run rustc for read shim");
+            assert!(status.success(), "read shim must compile");
+            library
+        })
+    }
+
+    /// 在读取垫片脚本作用下运行 check-digest，两个流按默认方式捕获。
+    fn run_check_with_read_shim(script: &str, path: &Path, expected: &OsStr) -> Output {
+        inkseal()
+            .arg("check-digest")
+            .arg(path)
+            .arg(expected)
+            .env("LD_PRELOAD", read_shim())
+            .env("INKSEAL_READ_SHIM", script)
+            .output()
+            .expect("failed to run inkseal")
+    }
+
+    /// 文件已打开、读到部分内容后读取失败的完整约定：退出码 1（正常结束
+    /// 而非被信号杀死）、标准输出为空、标准错误是一条单行
+    /// `inkseal: cannot read '<路径>': failed to read input: <原因>`，
+    /// 既不是打不开、不匹配或输出失败，也不出现崩溃信息或任何摘要值。
+    fn assert_cannot_read(output: &Output, file_name: &str, reason: &str) {
+        assert_eq!(output.status.code(), Some(1), "exit code: {output:?}");
+        assert!(output.status.code().is_some(), "must end normally, not killed: {output:?}");
+        assert!(
+            output.stdout.is_empty(),
+            "stdout must stay empty on read failure: {:?}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        let stderr = String::from_utf8(output.stderr.clone()).expect("stderr must be UTF-8");
+        assert!(
+            stderr.ends_with('\n') && !stderr[..stderr.len() - 1].contains('\n'),
+            "hint must be a single line: {stderr:?}"
+        );
+        assert!(
+            stderr.starts_with("inkseal: cannot read '"),
+            "must report a read failure: {stderr:?}"
+        );
+        assert!(
+            stderr.contains(file_name),
+            "must name the failing path: {stderr:?}"
+        );
+        assert!(
+            stderr.contains("failed to read input"),
+            "must keep the existing read-failure wording: {stderr:?}"
+        );
+        assert!(
+            stderr.contains(reason),
+            "must keep the specific OS cause {reason:?}: {stderr:?}"
+        );
+        for forbidden in [
+            "cannot open",
+            "mismatch",
+            "unable to write",
+            "panicked",
+            "expected:",
+            "actual:",
+            "OK",
+        ] {
+            assert!(
+                !stderr.contains(forbidden),
+                "{forbidden:?} must not appear in a read-failure hint: {stderr:?}"
+            );
+        }
+        // 绝不输出任何 64 位十六进制摘要——已读前缀的摘要也不能出现。
+        let leaks_digest = stderr
+            .split(|c: char| !c.is_ascii_hexdigit())
+            .any(|token| token.len() == 64);
+        assert!(!leaks_digest, "no digest value may appear in the hint: {stderr:?}");
+    }
+
+    /// 含零字节、非法 UTF-8 与 LF/CRLF/CR 三种换行、且无末尾换行的内容。
+    /// 独立依据：python3 hashlib.sha256(下面这 48 个字节)（与库常量一致）。
+    const SPECIAL_HEX: &str =
+        "879e1d6af3829ebad59012630ce80b422b1bf81dbdc2bc0c1ba940f46f2dde3c";
+
+    fn special_content() -> Vec<u8> {
+        b"alpha\nbeta\r\ngamma\rdelta\n\x00\xff\xfe\x80tail-without-newline".to_vec()
+    }
+
+    /// 独立依据：python3 对 (i*31+7)%256、长度 3*64KiB+1234 的序列计算结果
+    /// （与库内长内容常量一致）。
+    const LONG_HEX: &str =
+        "8ca02b16ce35f9fca993a0fdf5a537fc72a62a77b2e6fa852a371f18b8e3fcc4";
+
+    fn long_content() -> Vec<u8> {
+        (0..(3 * 64 * 1024 + 1234))
+            .map(|i| ((i * 31 + 7) % 256) as u8)
+            .collect()
+    }
+
+    /// 已读前缀（32 字节）与其后尚未读取的后缀（44 字节）；预期摘要故意
+    /// 可以指向前缀，制造“已读部分恰好匹配”的误判陷阱。
+    const PREFIX: &[u8] = b"partial bytes before the failure";
+    const SUFFIX: &[u8] = b"::remaining bytes that must also be digested";
+    /// 独立依据：python3 hashlib.sha256(PREFIX)（亦与库测试注释交叉一致）。
+    const PREFIX_HEX: &str =
+        "2b7e878471b3ebc8ea1c831f07bb3adc450e78ca01c751e760b7de84a6ed3df1";
+    /// 独立依据：python3 hashlib.sha256(PREFIX ++ SUFFIX)。
+    const FULL_HEX: &str =
+        "adaae83de72a3240a7edf4b2bacf187ab0d4c76a6c1648ebd0667ef881f98603";
+
+    fn trap_content() -> Vec<u8> {
+        let mut data = PREFIX.to_vec();
+        data.extend_from_slice(SUFFIX);
+        data
+    }
+
+    #[test]
+    fn interruptions_before_first_byte_between_bytes_and_before_eof_still_check_whole_file() {
+        let dir = TestDir::new("read-intr-special");
+        let content = special_content();
+        assert_eq!(content.len(), 48, "test fixture length");
+        let path = dir.write_file(OsStr::new("special.bin"), &content);
+
+        // 第一个字节之前中断；随后每次只读 1 字节（短读不代表结束）；
+        // 最后一段内容之后、确认 EOF 之前再中断一次。脚本耗尽后透传，
+        // 由一次真实的 read 返回 0 明确结束。
+        let mut steps = vec!["i".to_string()];
+        steps.extend((0..content.len()).map(|_| "s1".to_string()));
+        steps.push("i".to_string());
+
+        let output = run_check_with_read_shim(&steps.join(","), &path, OsStr::new(SPECIAL_HEX));
+
+        // 结果必须对应整份原始字节：零字节、非 UTF-8 与各种换行都保留，
+        // 后续内容不遗漏，已读字节不重复——任何偏差都会让摘要不同。
+        assert_check_ok(&output);
+    }
+
+    #[test]
+    fn one_byte_reads_are_not_treated_as_end_of_file() {
+        let dir = TestDir::new("read-one-byte");
+        let content = special_content();
+        let path = dir.write_file(OsStr::new("special.bin"), &content);
+
+        // 全程每次只读到 1 个字节；循环必须持续到 read 明确返回 0，
+        // 绝不能把“这次只拿到少量字节”当作文件结束。
+        let script = vec!["s1"; content.len()].join(",");
+        let output = run_check_with_read_shim(&script, &path, OsStr::new(SPECIAL_HEX));
+
+        assert_check_ok(&output);
+    }
+
+    #[test]
+    fn interruption_after_final_chunk_before_eof_does_not_end_check_early() {
+        let dir = TestDir::new("read-intr-long");
+        let content = long_content();
+        let path = dir.write_file(OsStr::new("long.bin"), &content);
+
+        // 独立常量与库计算交叉一致，避免库与命令共享同一缺陷却通过测试。
+        assert_eq!(
+            inkseal::digest_reader(&content[..]).unwrap().to_hex(),
+            LONG_HEX
+        );
+
+        // 跨越多次内部读取，末段不整齐；最后一段内容读完后、确认结束前
+        // 发生中断（甚至连续多次），核对都必须继续到明确的 EOF 再比较。
+        let chunks = vec!["s60000"; 4].join(",");
+        let one_intr = format!("{chunks},i");
+        let repeated_intr = format!("{chunks},i,i,i");
+        for script in [one_intr, repeated_intr] {
+            let output =
+                run_check_with_read_shim(&script, &path, OsStr::new(LONG_HEX));
+            assert_check_ok(&output);
+        }
+    }
+
+    #[test]
+    fn interrupted_read_of_empty_file_reaches_explicit_eof() {
+        let dir = TestDir::new("read-intr-empty");
+        let path = dir.write_file(OsStr::new("empty"), b"");
+        let empty_hex =
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+
+        // 唯一一次读取先被中断：重试后必须由真实 read 返回 0 确认空文件，
+        // 中断本身既不是结束也不是失败。
+        let output = run_check_with_read_shim("i", &path, OsStr::new(empty_hex));
+
+        assert_check_ok(&output);
+    }
+
+    #[test]
+    fn real_read_error_after_partial_content_is_cannot_read_without_any_digest() {
+        let dir = TestDir::new("read-fail-partial");
+        let path = dir.write_file(OsStr::new("trap.bin"), &trap_content());
+
+        // 先成功读到部分内容（两次短读，至多 32 字节），随后出现真正的
+        // 读取错误 EIO；即便给出的预期摘要与整份文件相符，也不能报 OK。
+        let output = run_check_with_read_shim(
+            &format!("s16,s16,e{EIO}"),
+            &path,
+            OsStr::new(FULL_HEX),
+        );
+
+        assert_cannot_read(&output, "trap.bin", EIO_REASON);
+        // 既不能给出整份文件的摘要，也不能给出已读前缀的摘要。
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(!stderr.contains(FULL_HEX), "{stderr:?}");
+        assert!(!stderr.contains(PREFIX_HEX), "{stderr:?}");
+    }
+
+    #[test]
+    fn digest_matching_read_prefix_with_unread_bytes_then_error_is_still_read_failure() {
+        let dir = TestDir::new("read-prefix-trap");
+        let data = trap_content();
+        let path = dir.write_file(OsStr::new("trap.bin"), &data);
+
+        // 关键误判条件：预期摘要合法，且恰好等于“已经读到的那 32 字节
+        // 前缀”的摘要，但文件还有 44 字节尚未读取，紧接着读取失败。
+        // s1 强制逐字节读取，精确定位于前缀读完之后再注入 EIO。
+        let mut steps = vec!["s1".to_string(); PREFIX.len()];
+        steps.push(format!("e{EIO}"));
+        let output =
+            run_check_with_read_shim(&steps.join(","), &path, OsStr::new(PREFIX_HEX));
+
+        // 这仍然是读取失败：不能输出 OK，不能按前缀摘要生成不匹配，
+        // 也不能把部分摘要标为整个文件的实际摘要。
+        assert_cannot_read(&output, "trap.bin", EIO_REASON);
+        assert_ne!(output.stdout, b"OK\n", "must not succeed: {output:?}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(!stderr.to_lowercase().contains("mismatch"), "{stderr:?}");
+        assert!(!stderr.contains(PREFIX_HEX), "partial digest must not appear: {stderr:?}");
+        assert!(!stderr.contains(FULL_HEX), "{stderr:?}");
+    }
+
+    #[test]
+    fn real_error_after_interruptions_reports_the_later_error_cause() {
+        let dir = TestDir::new("read-intr-then-fail");
+        let path = dir.write_file(OsStr::new("trap.bin"), &trap_content());
+
+        // 先经历可恢复的临时中断（且读到部分内容），之后才出现真正的
+        // 读取错误 EACCES：提示必须反映后一次失败的具体原因，而不是之前
+        // 的中断。
+        let output = run_check_with_read_shim(
+            &format!("i,s16,i,s16,e{EACCES}"),
+            &path,
+            OsStr::new(FULL_HEX),
+        );
+        assert_cannot_read(&output, "trap.bin", EACCES_REASON);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(!stderr.contains("Interrupted"), "earlier EINTR must not be reported: {stderr:?}");
+        assert!(!stderr.contains("os error 4"), "{stderr:?}");
+        assert!(!stderr.contains(EIO_REASON), "{stderr:?}");
+
+        // 交换最后一步的 errno（改用 EIO），提示中的原因随之改变：
+        // 证明原因取自最后一次真实失败，而非任何写死的措辞。
+        let output = run_check_with_read_shim(
+            &format!("i,s8,e{EIO}"),
+            &path,
+            OsStr::new(FULL_HEX),
+        );
+        assert_cannot_read(&output, "trap.bin", EIO_REASON);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(!stderr.contains(EACCES_REASON), "{stderr:?}");
+    }
+
+    #[test]
+    fn after_full_read_recovers_mismatch_still_names_both_full_digests() {
+        let dir = TestDir::new("read-recover-mismatch");
+        let path = dir.write_file(OsStr::new("trap.bin"), &trap_content());
+
+        // 与前缀陷阱同一文件、同一预期摘要（前缀摘要），但这次读取在中断
+        // 与短读后最终完整成功：应报内容不匹配，且实际摘要是整份文件的
+        // 摘要，不是已读前缀的摘要。
+        let output = run_check_with_read_shim(
+            "i,s16,i,s16",
+            &path,
+            OsStr::new(PREFIX_HEX),
+        );
+
+        assert_mismatch(&output, PREFIX_HEX, FULL_HEX);
+    }
+
+    #[test]
+    fn read_failure_does_not_modify_input_or_create_result_files() {
+        let dir = TestDir::new("read-fail-sideeffects");
+        let path = dir.write_file(OsStr::new("trap.bin"), &trap_content());
+        let before = fs::read(&path).unwrap();
+
+        let output = run_check_with_read_shim(
+            &format!("s1,s1,e{EIO}"),
+            &path,
+            OsStr::new(FULL_HEX),
+        );
+        assert_eq!(output.status.code(), Some(1), "{output:?}");
+
+        // 输入文件字节保持不变，也不产生任何结果文件。
+        let after = fs::read(&path).unwrap();
+        assert_eq!(before, after, "input file must be untouched");
+        let entries = fs::read_dir(dir.path()).unwrap().count();
+        assert_eq!(entries, 1, "no result files may be created");
+    }
+}
+
 // ── 临时受阻后完整交付（EINTR 与短写）─────────────────────────────────────────
 //
 // 接收方仍可继续写入时，对输出端的 write 可能因信号临时中断（EINTR，一个
