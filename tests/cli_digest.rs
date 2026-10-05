@@ -808,3 +808,315 @@ mod output_failures {
         assert!(!stderr.contains("unable to write to standard output"), "{stderr:?}");
     }
 }
+
+// ── 标准错误写入失败 ─────────────────────────────────────────────────────────
+//
+// 用户把标准错误接到另一个程序，而接收方提前关闭管道时，失败提示本身可能
+// 写不出去。提示说明的是已经发生的失败：无论标准错误是否还可读，命令对
+// 本次操作的判断（退出码 1 或 2）都不能改变，更不能因 eprintln! 在
+// EPIPE/EBADF 上 panic 而以 101 崩溃。
+#[cfg(unix)]
+mod stderr_failures {
+    use super::*;
+    use std::fs::OpenOptions;
+    use std::io;
+    use std::os::raw::{c_int, c_void};
+    use std::os::unix::io::{FromRawFd, RawFd};
+    use std::process::Stdio;
+
+    unsafe extern "C" {
+        fn pipe(pipefd: *mut RawFd) -> c_int;
+        fn pipe2(pipefd: *mut RawFd, flags: c_int) -> c_int;
+        fn read(fd: RawFd, buf: *mut c_void, count: usize) -> isize;
+        fn close(fd: RawFd) -> c_int;
+        fn fcntl(fd: RawFd, cmd: c_int, arg: c_int) -> c_int;
+    }
+
+    /// 构造一个读端已经关闭的管道写端：子进程一写标准错误就收到 EPIPE，
+    /// 模拟“错误提示交给管道而接收方已提前关闭”，且一个字节都送不出去。
+    fn closed_pipe_stderr() -> Stdio {
+        let mut fds: [RawFd; 2] = [-1, -1];
+        assert_eq!(unsafe { pipe(fds.as_mut_ptr()) }, 0);
+        // 读端立即关闭（File 析构关闭该 fd）。
+        drop(unsafe { std::fs::File::from_raw_fd(fds[0]) });
+        Stdio::from(unsafe { std::fs::File::from_raw_fd(fds[1]) })
+    }
+
+    /// 以只读方式打开一个普通文件得到的 fd：对它写入会被内核拒绝，
+    /// 模拟“标准错误从一开始就被定向到拒绝写入的位置”。
+    fn read_only_stderr(path: &Path) -> Stdio {
+        let file = OpenOptions::new()
+            .read(true)
+            .write(false)
+            .open(path)
+            .expect("open read-only fd");
+        Stdio::from(file)
+    }
+
+    fn run_with_stderr(stderr: Stdio, args: &[&OsStr]) -> Output {
+        inkseal()
+            .args(args)
+            .stdout(Stdio::piped())
+            .stderr(stderr)
+            .output()
+            .expect("failed to run inkseal")
+    }
+
+    /// 标准错误从第一个字节起就不可写时，所有用法错误仍以退出码 2
+    /// 正常结束：不崩溃、不改报成功、不把用法说明挪到标准输出。
+    #[test]
+    fn usage_errors_with_dead_stderr_keep_exit_code_2() {
+        let dir = TestDir::new("stderr-usage");
+        let file = dir.write_file(OsStr::new("real.txt"), b"abc");
+        let missing = dir.path().join("does-not-exist");
+
+        let cases: Vec<Vec<&OsStr>> = vec![
+            vec![],                                              // 无参数
+            vec![OsStr::new("frobnicate")],                     // 未知子命令
+            vec![OsStr::new("digest")],                         // 缺少文件参数
+            vec![
+                OsStr::new("digest"),
+                file.as_os_str(),
+                OsStr::new("extra"),
+            ],                                                   // 多给参数
+            vec![OsStr::new("check-digest")],                   // 缺少两个参数
+            vec![OsStr::new("check-digest"), file.as_os_str()], // 缺少摘要参数
+            vec![
+                // 非法摘要 + 不存在的文件：格式校验先于文件访问，
+                // 即使格式提示无法写出，也必须是 2，且不去打开文件。
+                OsStr::new("check-digest"),
+                missing.as_os_str(),
+                OsStr::new("abc"),
+            ],
+        ];
+
+        for args in cases {
+            let output = run_with_stderr(closed_pipe_stderr(), &args);
+            assert_eq!(
+                output.status.code(),
+                Some(2),
+                "usage error must exit 2 even with dead stderr, args={args:?}: {output:?}"
+            );
+            // 必须是正常退出而非被信号终止（panic 会以 101 或 SIGABRT 结束）。
+            assert!(output.status.code().is_some(), "must not be killed: {output:?}");
+            assert!(
+                output.stdout.is_empty(),
+                "usage text must never move to stdout: {output:?}"
+            );
+            assert!(
+                output.stderr.is_empty(),
+                "dead pipe cannot carry any bytes: {output:?}"
+            );
+        }
+    }
+
+    /// 文件无法打开、路径为目录和摘要不匹配在标准错误完全不可写时，
+    /// 仍以退出码 1 正常结束；读取失败同理（见下方只读 fd 之外的情形）。
+    #[test]
+    fn io_and_mismatch_failures_with_dead_stderr_keep_exit_code_1() {
+        let dir = TestDir::new("stderr-failure");
+        let file = dir.write_file(OsStr::new("hello.txt"), b"abc");
+        let missing = dir.path().join("nope.txt");
+        let subdir = dir.path().join("a-directory");
+        fs::create_dir_all(&subdir).unwrap();
+        let empty_hex =
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+
+        let cases: Vec<Vec<&OsStr>> = vec![
+            vec![OsStr::new("digest"), missing.as_os_str()],
+            vec![OsStr::new("digest"), subdir.as_os_str()],
+            vec![
+                OsStr::new("check-digest"),
+                missing.as_os_str(),
+                OsStr::new(ABC_HEX),
+            ],
+            vec![
+                OsStr::new("check-digest"),
+                subdir.as_os_str(),
+                OsStr::new(ABC_HEX),
+            ],
+            vec![
+                OsStr::new("check-digest"),
+                file.as_os_str(),
+                OsStr::new(empty_hex),
+            ],
+        ];
+
+        for args in cases {
+            let output = run_with_stderr(closed_pipe_stderr(), &args);
+            assert_eq!(
+                output.status.code(),
+                Some(1),
+                "failure must keep exit 1 with dead stderr, args={args:?}: {output:?}"
+            );
+            assert!(
+                output.stdout.is_empty(),
+                "no success output may appear, args={args:?}: {output:?}"
+            );
+            assert!(output.stderr.is_empty(), "dead pipe carries no bytes: {output:?}");
+        }
+    }
+
+    /// 标准错误从一开始就拒绝写入（fd 以只读方式打开，内核直接拒绝）时，
+    /// 同样保留退出码且静默结束。
+    #[test]
+    fn read_only_stderr_keeps_exit_codes_without_panic() {
+        let dir = TestDir::new("stderr-readonly");
+        let sink = dir.write_file(OsStr::new("sink"), b"");
+        let missing = dir.path().join("nope.txt");
+
+        // 每次运行都需要一个新的只读 fd（Stdio 会消耗它）。
+        let usage = run_with_stderr(
+            read_only_stderr(&sink),
+            &[OsStr::new("digest")],
+        );
+        assert_eq!(usage.status.code(), Some(2), "{usage:?}");
+        assert!(usage.stdout.is_empty(), "{usage:?}");
+
+        let open_fail = run_with_stderr(
+            read_only_stderr(&sink),
+            &[OsStr::new("digest"), missing.as_os_str()],
+        );
+        assert_eq!(open_fail.status.code(), Some(1), "{open_fail:?}");
+        assert!(open_fail.stdout.is_empty(), "{open_fail:?}");
+        assert!(
+            !String::from_utf8_lossy(&open_fail.stderr).contains("panicked"),
+            "must not crash: {open_fail:?}"
+        );
+    }
+
+    /// 标准错误不可用本身不能使成功操作失败：版本查询、摘要计算、
+    /// 核对通过仍照常把结果写到标准输出并以 0 退出。
+    #[test]
+    fn success_is_unaffected_when_stderr_is_dead() {
+        let dir = TestDir::new("stderr-dead-success");
+        let path = dir.write_file(OsStr::new("hello.txt"), b"abc");
+
+        let version = run_with_stderr(closed_pipe_stderr(), &[OsStr::new("--version")]);
+        assert_eq!(version.status.code(), Some(0), "{version:?}");
+        assert_eq!(version.stdout, b"inkseal 0.1.0\n", "{version:?}");
+        assert!(version.stderr.is_empty());
+
+        let digest = run_with_stderr(
+            closed_pipe_stderr(),
+            &[OsStr::new("digest"), path.as_os_str()],
+        );
+        assert_eq!(digest.status.code(), Some(0), "{digest:?}");
+        assert_eq!(digest.stdout, format!("{ABC_HEX}\n").as_bytes(), "{digest:?}");
+
+        let check = run_with_stderr(
+            closed_pipe_stderr(),
+            &[
+                OsStr::new("check-digest"),
+                path.as_os_str(),
+                OsStr::new(ABC_HEX),
+            ],
+        );
+        assert_eq!(check.status.code(), Some(0), "{check:?}");
+        assert_eq!(check.stdout, b"OK\n", "{check:?}");
+    }
+
+    /// 成功结果无法写到标准输出、且连输出失败提示也无法写到标准错误时，
+    /// 按既有规则以 1 静默结束：两个流都为空，也没有崩溃信息。
+    #[test]
+    fn undeliverable_success_with_both_streams_dead_is_silent_exit_1() {
+        let dir = TestDir::new("both-dead");
+        let path = dir.write_file(OsStr::new("hello.txt"), b"abc");
+
+        let cases: Vec<Vec<&OsStr>> = vec![
+            vec![OsStr::new("--version")],
+            vec![OsStr::new("digest"), path.as_os_str()],
+            vec![
+                OsStr::new("check-digest"),
+                path.as_os_str(),
+                OsStr::new(ABC_HEX),
+            ],
+        ];
+        for args in cases {
+            let output = inkseal()
+                .args(&args)
+                .stdout(closed_pipe_stderr())
+                .stderr(closed_pipe_stderr())
+                .output()
+                .expect("failed to run inkseal");
+            assert_eq!(output.status.code(), Some(1), "args={args:?}: {output:?}");
+            assert!(output.stdout.is_empty(), "args={args:?}: {output:?}");
+            assert!(output.stderr.is_empty(), "args={args:?}: {output:?}");
+        }
+    }
+
+    /// 管道只接收了提示的前几个字节、接收方便提前关闭时，子进程在后续
+    /// 写入上收到 EPIPE：已发出的字节保留，退出码仍为 1，进程正常结束。
+    ///
+    /// 确定性地制造“部分送达后失败”：把管道容量缩到一个页面（4096），
+    /// 再让提示本身远大于该容量（超长路径触发的文件错误）。内核对
+    /// 大于 PIPE_BUF 的阻塞写是非原子的——写满容量后子进程阻塞等待，
+    /// 此时关闭读端，剩余写入必然以 EPIPE 失败，而提示开头的字节已经
+    /// 送达。若提示仍经由 eprintln! 写出，子进程会 panic（101/信号）。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn partial_stderr_write_failure_keeps_exit_code_without_panic() {
+        const F_SETPIPE_SZ: c_int = 1024 + 7;
+        // arm64/x86-64 Linux 上 O_CLOEXEC 均为 02000000（八进制）。
+        const O_CLOEXEC: c_int = 0o2000000;
+
+        let dir = TestDir::new("stderr-partial");
+        // 单条错误提示远超 PIPE_BUF（4096）：含约 10000 字节的路径名。
+        // 该路径无法打开（ENAMETOOLONG），属于退出码 1 的文件访问失败。
+        let path = dir.path().join("A".repeat(10_000));
+
+        // pipe2(…, O_CLOEXEC) 至关重要：读端不能被子进程继承，否则测试
+        // 关闭自己的读端副本后子进程仍持有读端，会无限阻塞地写给自己。
+        let mut fds: [RawFd; 2] = [-1, -1];
+        assert_eq!(
+            unsafe { pipe2(fds.as_mut_ptr(), O_CLOEXEC) },
+            0,
+            "{}",
+            io::Error::last_os_error()
+        );
+        let set = unsafe { fcntl(fds[1], F_SETPIPE_SZ, 4096) };
+        assert!(set >= 0, "shrink pipe: {}", io::Error::last_os_error());
+
+        let write_end = unsafe { std::fs::File::from_raw_fd(fds[1]) };
+        let child = inkseal()
+            .args(["digest"])
+            .arg(path.as_os_str())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::from(write_end))
+            .spawn()
+            .expect("failed to run inkseal");
+
+        // 子进程的首次写入已填满 4096 字节容量后阻塞；一次性取出这段
+        // 连续的提示前缀（在子进程补入更多字节之前读完）。
+        let mut prefix = vec![0u8; 4096];
+        read_full(fds[0], &mut prefix);
+        assert!(
+            prefix.starts_with(b"inkseal: cannot open '"),
+            "delivered prefix must be the real hint: {:?}",
+            String::from_utf8_lossy(&prefix[..40.min(prefix.len())])
+        );
+
+        // 接收方提前关闭：管道中已送达的提示前缀无需也无法补齐，
+        // 子进程剩余写入立即失败，但必须仍以退出码 1 正常结束。
+        assert_eq!(unsafe { close(fds[0]) }, 0);
+
+        let output = child.wait_with_output().expect("failed to wait");
+        assert_eq!(output.status.code(), Some(1), "{output:?}");
+        assert!(output.stdout.is_empty(), "{output:?}");
+        assert!(
+            !String::from_utf8_lossy(&output.stderr).contains("panicked"),
+            "must not crash: {output:?}"
+        );
+    }
+
+    /// 阻塞地从 fd 读满 `buf`，EINTR 立即重试。
+    #[cfg(target_os = "linux")]
+    fn read_full(fd: RawFd, mut buf: &mut [u8]) {
+        while !buf.is_empty() {
+            let n = unsafe { read(fd, buf.as_mut_ptr().cast::<c_void>(), buf.len()) };
+            assert!(n > 0, "read pipe: {}", io::Error::last_os_error());
+            let len = n as usize;
+            buf = &mut buf[len..];
+        }
+    }
+}
