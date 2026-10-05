@@ -81,13 +81,13 @@ fn run_digest(path: &Path) -> ExitCode {
 /// 无法也不必撤回。若连这条提示都写不出去，同样静默地以退出码 1
 /// 结束——报告输出失败的过程自身绝不能再崩溃。
 fn emit_success(line: &[u8]) -> ExitCode {
-    match write_stdout_all(line) {
+    match write_channel_all(Channel::Stdout, line) {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
             // 与失败路径同一条规则：提示本身写不出去也忽略，只需保证
             // 退出码为 1，绝不经过会因写失败而 panic 的宏。
             let hint = format!("inkseal: unable to write to standard output: {err}\n");
-            let _ = write_stderr_all(hint.as_bytes());
+            let _ = write_channel_all(Channel::Stderr, hint.as_bytes());
             ExitCode::FAILURE
         }
     }
@@ -104,16 +104,34 @@ fn emit_success(line: &[u8]) -> ExitCode {
 /// 已经送出的字节保留，写不出去的部分不补齐、不重试、不改写到标准输出，
 /// 只保证静默地以 `code` 正常结束。
 fn emit_error(code: u8, message: &[u8]) -> ExitCode {
-    let _ = write_stderr_all(message);
+    let _ = write_channel_all(Channel::Stderr, message);
     ExitCode::from(code)
 }
 
-/// 直接对标准错误的原始文件描述符发起 `write`，绕过标准库 `Stderr`
-/// 的行缓冲以及 `eprintln!`/`writeln!` 在写失败时的 panic（宏内部
-/// `unwrap`）。短写照常续写到同一 fd；EINTR 立即重试。任何无法继续
-/// 写入的错误都返回，由调用方决定忽略——失败提示本身绝不能再崩溃。
+/// 结果或提示要交付到的输出通道：标准输出或标准错误。
+///
+/// 两条通道共用同一份“完整交付”规则（见 [write_channel_all]），只有
+/// 目标 fd / 标准库句柄和错误文字中的通道名不同；成功结果与失败提示
+/// 各自的含义由 [emit_success] 与 [emit_error] 在调用处表达。
+#[derive(Clone, Copy)]
+enum Channel {
+    Stdout,
+    Stderr,
+}
+
+/// 把 `bytes` 完整交付到指定通道：短写照常续写，EINTR 立即重试，
+/// 真正的写入错误结束本次交付，返回 0 字节的无进展写入也按失败处理
+/// 而不是空转。任何错误都返回给调用方决定如何处理——报告过程自身
+/// 绝不能崩溃。
+///
+/// Unix 上直接对通道的原始文件描述符发起 `write`，绕过标准库
+/// `Stdout`/`Stderr` 的缓冲以及 `println!`/`eprintln!` 在写失败时的
+/// panic（宏内部 `unwrap`）；这也避开了标准库对“输出端不存在/拒绝
+/// 写入”这类失败的特殊处理——它在某些情况下会把失败（如 fd 以只读
+/// 方式打开时内核返回的 EBADF）静默报告为成功，导致调用方误以为
+/// 结果已交付。
 #[cfg(unix)]
-fn write_stderr_all(mut message: &[u8]) -> io::Result<()> {
+fn write_channel_all(channel: Channel, mut bytes: &[u8]) -> io::Result<()> {
     use std::os::raw::c_void;
     use std::os::fd::RawFd;
 
@@ -121,9 +139,12 @@ fn write_stderr_all(mut message: &[u8]) -> io::Result<()> {
         fn write(fd: RawFd, buf: *const c_void, count: usize) -> isize;
     }
 
-    const STDERR_FD: RawFd = 2;
-    while !message.is_empty() {
-        let written = unsafe { write(STDERR_FD, message.as_ptr().cast::<c_void>(), message.len()) };
+    let fd: RawFd = match channel {
+        Channel::Stdout => 1,
+        Channel::Stderr => 2,
+    };
+    while !bytes.is_empty() {
+        let written = unsafe { write(fd, bytes.as_ptr().cast::<c_void>(), bytes.len()) };
         if written < 0 {
             let err = io::Error::last_os_error();
             // 临时中断不代表任何字节的命运，原地重试。
@@ -138,72 +159,45 @@ fn write_stderr_all(mut message: &[u8]) -> io::Result<()> {
             // 避免在此空转。
             return Err(io::Error::new(
                 io::ErrorKind::WriteZero,
-                "write to standard error returned no progress",
+                format!("write to {} returned no progress", channel.name()),
             ));
         }
-        message = &message[n..];
+        bytes = &bytes[n..];
     }
     Ok(())
 }
 
-/// 非 Unix 目标：沿用加锁写入并显式刷新；写失败同样由调用方忽略。
-#[cfg(not(unix))]
-fn write_stderr_all(message: &[u8]) -> io::Result<()> {
-    use std::io::Write;
-
-    let stderr = io::stderr();
-    let mut handle = stderr.lock();
-    handle.write_all(message)?;
-    handle.flush()
-}
-
-/// 直接对标准输出的原始文件描述符发起 `write`，绕过标准库 `Stdout`
-/// 对“输出端不存在/拒绝写入”这类失败的特殊处理——它在某些情况下会把
-/// 失败（如 fd 以只读方式打开时内核返回的 EBADF）静默报告为成功，导致
-/// 调用方误以为结果已交付。短写照常续写到同一 fd；EINTR 立即重试。
 #[cfg(unix)]
-fn write_stdout_all(mut line: &[u8]) -> io::Result<()> {
-    use std::os::raw::c_void;
-    use std::os::fd::RawFd;
-
-    unsafe extern "C" {
-        fn write(fd: RawFd, buf: *const c_void, count: usize) -> isize;
-    }
-
-    const STDOUT_FD: RawFd = 1;
-    while !line.is_empty() {
-        let written = unsafe { write(STDOUT_FD, line.as_ptr().cast::<c_void>(), line.len()) };
-        if written < 0 {
-            let err = io::Error::last_os_error();
-            // 临时中断不代表任何字节的命运，原地重试。
-            if err.kind() == io::ErrorKind::Interrupted {
-                continue;
-            }
-            return Err(err);
+impl Channel {
+    /// 错误文字中使用的通道名，与既有提示文字一致。
+    fn name(self) -> &'static str {
+        match self {
+            Channel::Stdout => "standard output",
+            Channel::Stderr => "standard error",
         }
-        let n = written as usize;
-        if n == 0 {
-            // 对正数计数的 write 返回 0 没有可恢复的含义，按写出失败处理，
-            // 避免在此空转。
-            return Err(io::Error::new(
-                io::ErrorKind::WriteZero,
-                "write to standard output returned no progress",
-            ));
-        }
-        line = &line[n..];
     }
-    Ok(())
 }
 
-/// 非 Unix 目标：标准库句柄不存在上述特殊处理，沿用加锁写入并显式刷新。
+/// 非 Unix 目标：标准库句柄不存在上述特殊处理，沿用加锁写入并显式
+/// 刷新；写失败同样返回给调用方决定忽略。
 #[cfg(not(unix))]
-fn write_stdout_all(line: &[u8]) -> io::Result<()> {
+fn write_channel_all(channel: Channel, bytes: &[u8]) -> io::Result<()> {
     use std::io::Write;
 
-    let stdout = io::stdout();
-    let mut handle = stdout.lock();
-    handle.write_all(line)?;
-    handle.flush()
+    match channel {
+        Channel::Stdout => {
+            let stdout = io::stdout();
+            let mut handle = stdout.lock();
+            handle.write_all(bytes)?;
+            handle.flush()
+        }
+        Channel::Stderr => {
+            let stderr = io::stderr();
+            let mut handle = stderr.lock();
+            handle.write_all(bytes)?;
+            handle.flush()
+        }
+    }
 }
 
 /// 解析用户给出的预期摘要。
