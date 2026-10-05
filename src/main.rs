@@ -2,10 +2,43 @@ use inkseal::{ParseDigestError, Sha256Digest};
 use std::env;
 use std::ffi::OsStr;
 use std::fs::File;
+use std::io::{self, Write};
 use std::path::Path;
 use std::process::ExitCode;
 
 const USAGE: &str = "Usage: inkseal --version\n       inkseal digest <file>\n       inkseal check-digest <file> <digest>";
+
+/// 把一行成功结果完整写到标准输出（含末尾换行），并确保数据真正送出。
+///
+/// 成功意味着整行结果已经完整交付，而不只是内容已经计算完毕：写入或
+/// 刷新失败（例如标准输出被重定向到拒绝写入的位置，或管道接收方提前
+/// 关闭）都视为失败。调用方随后通过 [report_stdout_error] 报告错误。
+fn write_stdout_line(line: &str) -> io::Result<()> {
+    let stdout = io::stdout();
+    let mut handle = stdout.lock();
+    handle.write_all(line.as_bytes())?;
+    handle.write_all(b"\n")?;
+    // BufWriter 等缓冲层可能把最后的写入错误延迟到 flush；这里用的是
+    // 未缓冲的 Stdout，但 flush 也会触发底层最终交付，必须检查其结果。
+    handle.flush()
+}
+
+/// 报告“无法写入标准输出”。
+///
+/// 只在标准错误给出一条以 `inkseal:` 开头的提示，并保留系统提供的具体
+/// 原因；不把它说成文件读取或内容问题，也不追加用法说明。此前可能已经
+/// 有结果的前几个字节送达标准输出，既不撤回也不再补写整行或成功标记。
+/// 若连这条提示也无法写出（例如标准错误同样关闭），静默处理——调用方
+/// 仍以退出码 1 结束，报告错误本身绝不能再次导致崩溃。
+fn report_stdout_error(err: &io::Error) {
+    let result = (|| -> io::Result<()> {
+        let stderr = io::stderr();
+        let mut handle = stderr.lock();
+        writeln!(handle, "inkseal: failed to write to standard output: {err}")?;
+        handle.flush()
+    })();
+    let _ = result;
+}
 
 fn main() -> ExitCode {
     // 使用 args_os 而非 args：命令行参数是操作系统给出的原始字节，
@@ -13,7 +46,10 @@ fn main() -> ExitCode {
     let mut args = env::args_os().skip(1);
     match args.next() {
         Some(ref cmd) if cmd.as_encoded_bytes() == b"--version" && args.next().is_none() => {
-            println!("inkseal 0.1.0");
+            if let Err(err) = write_stdout_line("inkseal 0.1.0") {
+                report_stdout_error(&err);
+                return ExitCode::FAILURE;
+            }
             ExitCode::SUCCESS
         }
         Some(ref cmd) if cmd.as_encoded_bytes() == b"digest" => {
@@ -52,7 +88,10 @@ fn run_digest(path: &Path) -> ExitCode {
     };
     match inkseal::digest_reader(file) {
         Ok(digest) => {
-            println!("{}", digest.to_hex());
+            if let Err(err) = write_stdout_line(&digest.to_hex()) {
+                report_stdout_error(&err);
+                return ExitCode::FAILURE;
+            }
             ExitCode::SUCCESS
         }
         Err(err) => {
@@ -112,7 +151,10 @@ fn run_check_digest(path: &Path, expected_arg: &OsStr) -> ExitCode {
     };
 
     if actual == expected {
-        println!("OK");
+        if let Err(err) = write_stdout_line("OK") {
+            report_stdout_error(&err);
+            return ExitCode::FAILURE;
+        }
         ExitCode::SUCCESS
     } else {
         // 内容不匹配：预期与实际都用库的同一显示规则呈现为

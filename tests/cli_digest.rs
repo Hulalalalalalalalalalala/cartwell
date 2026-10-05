@@ -631,3 +631,197 @@ fn check_digest_non_utf8_digest_argument_is_usage_error_without_opening_file() {
     let stderr = assert_usage_error(&output);
     assert!(!stderr.contains("cannot open"), "{stderr:?}");
 }
+
+// ── 标准输出写入失败 ─────────────────────────────────────────────────────────
+
+#[cfg(unix)]
+mod stdout_write_failures {
+    use super::*;
+
+    /// /dev/full 对任何写入都返回 ENOSPC：用来稳定复现“成功结果无法
+    /// 写到标准输出”，无需依赖管道关闭时序。
+    const DEV_FULL: &str = "/dev/full";
+
+    /// 输出失败的完整约定：退出码 1；标准错误恰好一行，以 `inkseal:`
+    /// 开头，说明无法写入标准输出并保留系统给出的具体原因；不追加用法。
+    fn assert_stdout_write_failure(output: &Output) {
+        assert_eq!(output.status.code(), Some(1), "exit code: {output:?}");
+        let stderr =
+            String::from_utf8(output.stderr.clone()).expect("stderr must be UTF-8");
+        assert!(
+            stderr.ends_with('\n') && !stderr[..stderr.len() - 1].contains('\n'),
+            "error message must be a single line: {stderr:?}"
+        );
+        assert!(
+            stderr.starts_with("inkseal: ") && stderr.contains("standard output"),
+            "must report a stdout write failure: {stderr:?}"
+        );
+        // 必须保留系统提供的具体原因，而不是笼统的自定义文案。
+        assert!(
+            stderr.contains("No space left on device") || stderr.contains("os error 28"),
+            "must preserve the OS-provided reason: {stderr:?}"
+        );
+        // 不能伪装成其他失败，也不能在标准错误追加用法或结果本身。
+        assert!(!stderr.contains("Usage:"), "no usage on output failure: {stderr:?}");
+        assert!(!stderr.contains("cannot read"), "{stderr:?}");
+        assert!(!stderr.contains("cannot open"), "{stderr:?}");
+        assert!(!stderr.contains("mismatch"), "{stderr:?}");
+        assert_eq!(stderr.matches("inkseal:").count(), 1, "{stderr:?}");
+    }
+
+    fn run_with_dev_full_stdout(args: &[&str]) -> Output {
+        let full = fs::OpenOptions::new()
+            .write(true)
+            .open(DEV_FULL)
+            .expect("open /dev/full");
+        inkseal()
+            .args(args)
+            .stdout(full)
+            .output()
+            .expect("failed to run inkseal")
+    }
+
+    #[test]
+    fn digest_write_failure_is_exit_1_with_message_on_stderr() {
+        let dir = TestDir::new("stdout-full-digest");
+        let path = dir.write_file(OsStr::new("f"), b"abc");
+
+        let output = run_with_dev_full_stdout(&["digest", path.to_str().unwrap()]);
+
+        assert_stdout_write_failure(&output);
+        // 摘要绝不能改道写到标准错误。
+        assert!(!String::from_utf8_lossy(&output.stderr).contains(ABC_HEX));
+    }
+
+    #[test]
+    fn check_digest_match_write_failure_is_exit_1_with_message_on_stderr() {
+        let dir = TestDir::new("stdout-full-check");
+        let path = dir.write_file(OsStr::new("f"), b"abc");
+
+        let output = run_with_dev_full_stdout(&[
+            "check-digest",
+            path.to_str().unwrap(),
+            ABC_HEX,
+        ]);
+
+        assert_stdout_write_failure(&output);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        // 匹配已通过但结果没交付：不能在错误流补写成功标记。
+        assert!(!stderr.contains("OK"));
+    }
+
+    #[test]
+    fn version_write_failure_is_exit_1_with_message_on_stderr() {
+        let output = run_with_dev_full_stdout(&["--version"]);
+
+        assert_stdout_write_failure(&output);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(!stderr.contains("inkseal 0.1.0"), "version must not go to stderr: {stderr:?}");
+    }
+
+    #[test]
+    fn non_output_failures_keep_their_own_behavior_when_stdout_unwritable() {
+        // 没有成功结果需要写出的失败分支，不得仅因标准输出不可用而被
+        // 替换成输出错误：退出码与提示维持各自原有约定。
+        let dir = TestDir::new("stdout-full-other-failures");
+        let path = dir.write_file(OsStr::new("f"), b"abc");
+        let missing = dir.path().join("nope");
+        let empty_hex =
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+
+        // 用法错误：仍是退出码 2 和用法提示。
+        let output = run_with_dev_full_stdout(&["digest"]);
+        assert_eq!(output.status.code(), Some(2), "{output:?}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains("Usage:"), "{stderr:?}");
+        assert!(!stderr.contains("standard output"), "{stderr:?}");
+
+        // 文件打开失败：仍是退出码 1 和 cannot open 提示。
+        let output = run_with_dev_full_stdout(&["digest", missing.to_str().unwrap()]);
+        assert_eq!(output.status.code(), Some(1), "{output:?}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains("cannot open"), "{stderr:?}");
+        assert!(!stderr.contains("standard output"), "{stderr:?}");
+
+        // 内容不匹配：仍是 mismatch 提示，且不写 OK。
+        let output = run_with_dev_full_stdout(&[
+            "check-digest",
+            path.to_str().unwrap(),
+            empty_hex,
+        ]);
+        assert_eq!(output.status.code(), Some(1), "{output:?}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains("mismatch"), "{stderr:?}");
+        assert!(!stderr.contains("standard output"), "{stderr:?}");
+
+        // 摘要格式错误：仍先于文件访问报退出码 2。
+        let output = run_with_dev_full_stdout(&[
+            "check-digest",
+            missing.to_str().unwrap(),
+            "too-short",
+        ]);
+        assert_eq!(output.status.code(), Some(2), "{output:?}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains("invalid expected digest"), "{stderr:?}");
+    }
+
+    /// 管道接收方在进程写出结果前关闭读端：写入得到 EPIPE（SIGPIPE 在
+    /// Rust 程序里默认被忽略，错误必须被当作普通写出失败处理而非崩溃）。
+    #[test]
+    fn closed_pipe_before_write_is_exit_1_not_a_panic() {
+        use std::os::unix::io::{FromRawFd, IntoRawFd};
+
+        let dir = TestDir::new("stdout-closed-pipe");
+        let path = dir.write_file(OsStr::new("f"), b"abc");
+
+        for args in [
+            vec!["digest".to_owned(), path.to_str().unwrap().to_owned()],
+            vec![
+                "check-digest".to_owned(),
+                path.to_str().unwrap().to_owned(),
+                ABC_HEX.to_owned(),
+            ],
+            vec!["--version".to_owned()],
+        ] {
+            let (reader, writer) = nix_pipe();
+            drop(reader); // 接收方在子进程写出前已关闭。
+            let output = inkseal()
+                .args(&args)
+                .stdout(unsafe { fs::File::from_raw_fd(writer.into_raw_fd()) })
+                .output()
+                .expect("failed to run inkseal");
+
+            assert_eq!(output.status.code(), Some(1), "args: {args:?}: {output:?}");
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                stderr.starts_with("inkseal: ") && stderr.contains("standard output"),
+                "args: {args:?}: {stderr:?}"
+            );
+            assert!(
+                stderr.contains("Broken pipe") || stderr.contains("os error 32"),
+                "args: {args:?}: {stderr:?}"
+            );
+            // 必须是正常退出而非被 SIGPIPE/其他信号杀死，也不能有 panic 信息。
+            assert!(output.status.code().is_some(), "killed by signal: {output:?}");
+            assert!(!stderr.contains("panicked"), "{stderr:?}");
+        }
+    }
+
+    /// 一对真正的匿名管道文件描述符（避免依赖额外 crate）。
+    fn nix_pipe() -> (std::fs::File, std::fs::File) {
+        use std::os::unix::io::{FromRawFd, RawFd};
+
+        unsafe extern "C" {
+            fn pipe(fds: *mut RawFd) -> i32;
+        }
+        let mut fds = [0 as RawFd; 2];
+        let rc = unsafe { pipe(fds.as_mut_ptr()) };
+        assert_eq!(rc, 0, "pipe() failed");
+        unsafe {
+            (
+                std::fs::File::from_raw_fd(fds[0]),
+                std::fs::File::from_raw_fd(fds[1]),
+            )
+        }
+    }
+}
