@@ -72,15 +72,19 @@ impl From<io::Error> for DigestError {
 /// 以流式方式读取 `reader` 的全部字节并计算 SHA-256 摘要。
 ///
 /// 内存占用与输入大小无关。读取失败时返回 [`DigestError`]，绝不返回部分内容的摘要。
+///
+/// 单次读取返回 [`io::ErrorKind::Interrupted`] 视为临时中断：不丢弃已读内容、
+/// 不提前结束，直接重试同一次读取，直到取得数据、输入结束或发生真正的错误。
 pub fn digest_reader<R: Read>(mut reader: R) -> Result<Sha256Digest, DigestError> {
     let mut hasher = Sha256::new();
     let mut buf = [0u8; 64 * 1024];
     loop {
-        let n = reader.read(&mut buf)?;
-        if n == 0 {
-            break;
+        match reader.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => hasher.update(&buf[..n]),
+            Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
+            Err(err) => return Err(DigestError(err)),
         }
-        hasher.update(&buf[..n]);
     }
     Ok(Sha256Digest(hasher.finalize().into()))
 }
@@ -278,5 +282,143 @@ mod tests {
         assert_eq!(hex.len(), 64);
         assert!(hex.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
         assert!(!hex.chars().any(char::is_whitespace));
+    }
+
+    /// 按脚本演出的读取器：每一步要么返回下一段数据、要么返回一个错误、
+    /// 要么报告输入结束。用于精确模拟中断出现的时机。
+    struct ScriptedReader<'a> {
+        steps: &'a [Step],
+        index: usize,
+    }
+
+    enum Step {
+        Data(&'static [u8]),
+        Fail(io::ErrorKind, &'static str),
+        Eof,
+    }
+
+    impl<'a> ScriptedReader<'a> {
+        fn new(steps: &'a [Step]) -> Self {
+            ScriptedReader { steps, index: 0 }
+        }
+    }
+
+    impl Read for ScriptedReader<'_> {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            match &self.steps[self.index] {
+                Step::Data(data) => {
+                    self.index += 1;
+                    let n = data.len().min(buf.len());
+                    buf[..n].copy_from_slice(&data[..n]);
+                    Ok(n)
+                }
+                Step::Fail(kind, msg) => {
+                    self.index += 1;
+                    Err(io::Error::new(*kind, *msg))
+                }
+                Step::Eof => Ok(0),
+            }
+        }
+    }
+
+    fn interrupted() -> Step {
+        Step::Fail(io::ErrorKind::Interrupted, "interrupted")
+    }
+
+    #[test]
+    fn interruption_before_first_byte_is_retried() {
+        let steps = [interrupted(), Step::Data(b"abc"), Step::Eof];
+        let digest = digest_reader(ScriptedReader::new(&steps)).unwrap();
+        assert_eq!(digest, digest_reader(&b"abc"[..]).unwrap());
+    }
+
+    #[test]
+    fn interruption_between_chunks_is_retried() {
+        let steps = [
+            Step::Data(b"alpha\n"),
+            interrupted(),
+            Step::Data(b"beta\r\n\x00\xff"),
+            Step::Eof,
+        ];
+        let digest = digest_reader(ScriptedReader::new(&steps)).unwrap();
+        assert_eq!(digest, digest_reader(&b"alpha\nbeta\r\n\x00\xff"[..]).unwrap());
+    }
+
+    #[test]
+    fn interruption_after_last_chunk_before_eof_is_retried() {
+        let steps = [Step::Data(b"abc"), interrupted(), Step::Eof];
+        let digest = digest_reader(ScriptedReader::new(&steps)).unwrap();
+        assert_eq!(digest, digest_reader(&b"abc"[..]).unwrap());
+    }
+
+    #[test]
+    fn consecutive_interruptions_are_all_retried() {
+        let steps = [
+            interrupted(),
+            interrupted(),
+            Step::Data(b"ab"),
+            interrupted(),
+            interrupted(),
+            interrupted(),
+            Step::Data(b"c"),
+            interrupted(),
+            Step::Eof,
+        ];
+        let digest = digest_reader(ScriptedReader::new(&steps)).unwrap();
+        assert_eq!(digest, digest_reader(&b"abc"[..]).unwrap());
+    }
+
+    #[test]
+    fn interruption_with_long_input_and_short_chunks_matches_uninterrupted() {
+        let data = long_input();
+        let expected = digest_reader(&data[..]).unwrap();
+
+        // 短片段（含 1 字节）之间夹杂中断：短片段是有效内容，不是结尾。
+        struct InterruptingChunked<'a> {
+            inner: ChunkedReader<'a>,
+            interrupt_before: &'a [usize],
+            reads: usize,
+        }
+        impl Read for InterruptingChunked<'_> {
+            fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+                if self.interrupt_before.contains(&self.reads) {
+                    self.reads += 1;
+                    return Err(io::Error::new(io::ErrorKind::Interrupted, "interrupted"));
+                }
+                self.reads += 1;
+                self.inner.read(buf)
+            }
+        }
+        let reader = InterruptingChunked {
+            inner: ChunkedReader::new(&data, &[1, 999, 64 * 1024, 17]),
+            interrupt_before: &[0, 3, 7, 7, 12],
+            reads: 0,
+        };
+        let digest = digest_reader(reader).unwrap();
+        assert_eq!(digest, expected);
+        assert_eq!(digest.to_hex(), LONG_INPUT_HEX);
+    }
+
+    #[test]
+    fn non_interrupted_error_after_interruption_still_fails() {
+        // 临时中断之后发生真正的错误：本次调用必须失败，
+        // 报告的是真正的错误，而不是之前的中断，也不是部分内容的摘要。
+        let steps = [
+            Step::Data(b"prefix"),
+            interrupted(),
+            Step::Fail(io::ErrorKind::PermissionDenied, "disk vanished"),
+            Step::Eof,
+        ];
+        let err = digest_reader(ScriptedReader::new(&steps)).unwrap_err();
+        assert!(err.to_string().contains("disk vanished"));
+        let inner = err.into_inner();
+        assert_eq!(inner.kind(), io::ErrorKind::PermissionDenied);
+    }
+
+    #[test]
+    fn error_kind_other_than_interrupted_is_not_retried() {
+        let steps = [Step::Fail(io::ErrorKind::InvalidData, "corrupt"), Step::Data(b"abc"), Step::Eof];
+        let err = digest_reader(ScriptedReader::new(&steps)).unwrap_err();
+        assert_eq!(err.into_inner().kind(), io::ErrorKind::InvalidData);
     }
 }
