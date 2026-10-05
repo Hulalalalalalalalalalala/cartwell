@@ -2,7 +2,9 @@ use inkseal::{ParseDigestError, Sha256Digest};
 use std::env;
 use std::ffi::OsStr;
 use std::fs::File;
-use std::io::{self, Write};
+use std::io;
+#[cfg(not(unix))]
+use std::io::Write;
 use std::path::Path;
 use std::process::ExitCode;
 
@@ -18,22 +20,23 @@ fn main() -> ExitCode {
         }
         Some(ref cmd) if cmd.as_encoded_bytes() == b"digest" => {
             let (Some(path), None) = (args.next(), args.next()) else {
-                eprintln!("{USAGE}");
+                emit_usage_error(None);
                 return ExitCode::from(2);
             };
             run_digest(Path::new(&path))
         }
         Some(ref cmd) if cmd.as_encoded_bytes() == b"check-digest" => {
             let (Some(path), Some(expected), None) = (args.next(), args.next(), args.next()) else {
-                eprintln!("inkseal: check-digest requires exactly two arguments: <file> <digest>");
-                eprintln!("{USAGE}");
+                emit_usage_error(Some(
+                    "inkseal: check-digest requires exactly two arguments: <file> <digest>",
+                ));
                 return ExitCode::from(2);
             };
             run_check_digest(Path::new(&path), &expected)
         }
         _ => {
             // 未知子命令（即便含有非 UTF-8 字节）等用法错误统一走这里。
-            eprintln!("{USAGE}");
+            emit_usage_error(None);
             ExitCode::from(2)
         }
     }
@@ -46,7 +49,7 @@ fn run_digest(path: &Path) -> ExitCode {
     let file = match File::open(path) {
         Ok(file) => file,
         Err(err) => {
-            eprintln!("inkseal: cannot open '{display}': {err}");
+            emit_error_line(&format!("inkseal: cannot open '{display}': {err}"));
             return ExitCode::FAILURE;
         }
     };
@@ -57,7 +60,7 @@ fn run_digest(path: &Path) -> ExitCode {
             emit_success(line.as_bytes())
         }
         Err(err) => {
-            eprintln!("inkseal: cannot read '{display}': {err}");
+            emit_error_line(&format!("inkseal: cannot read '{display}': {err}"));
             ExitCode::FAILURE
         }
     }
@@ -79,18 +82,36 @@ fn emit_success(line: &[u8]) -> ExitCode {
     match write_stdout_all(line) {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
-            // 直接走 Write trait 写原始字节，不经过会因写失败而 panic 的宏；
-            // 提示本身写不出去也忽略，只需保证退出码为 1。
-            let stderr = io::stderr();
-            let mut err_handle = stderr.lock();
-            let _ = writeln!(
-                err_handle,
+            // 走与其他错误提示相同的尽力写出通道：它不会因标准错误
+            // 拒绝写入（EPIPE/EBADF）而 panic，只需保证退出码为 1。
+            emit_error_line(&format!(
                 "inkseal: unable to write to standard output: {err}"
-            );
-            let _ = err_handle.flush();
+            ));
             ExitCode::FAILURE
         }
     }
+}
+
+/// 向标准错误尽力写出一行提示（自动补一个换行），任何写入失败都被
+/// 静默忽略：错误提示说明的是**已经判定的失败**，接收方能否读到提示
+/// 绝不改变本次操作的结论与退出码，更不能以 panic（退出码 101）掩盖
+/// 约定的退出码。可能只送出部分字节，剩余内容无需补齐；绝不因此改写
+/// 标准输出。
+fn emit_error_line(message: &str) {
+    // 追加换行以保持既有提示的行结构；写失败或只送出部分字节都忽略，
+    // 调用方只关心已经判定的退出码。
+    let _ = write_stderr_all(message.as_bytes());
+    let _ = write_stderr_all(b"\n");
+}
+
+/// 用法错误的提示：可选的单行说明在前，统一的用法说明在后。
+/// 两行都走尽力写出通道；与 [emit_error_line] 一样，写不出去时调用方
+/// 仍按用法错误（退出码 2）结束。
+fn emit_usage_error(detail: Option<&str>) {
+    if let Some(detail) = detail {
+        emit_error_line(detail);
+    }
+    emit_error_line(USAGE);
 }
 
 /// 直接对标准输出的原始文件描述符发起 `write`，绕过标准库 `Stdout`
@@ -140,6 +161,54 @@ fn write_stdout_all(line: &[u8]) -> io::Result<()> {
     handle.flush()
 }
 
+/// 直接对标准错误的原始文件描述符尽力发起 `write`，错误提示专用。
+///
+/// 与标准库的 `Stderr`/`eprintln!` 不同，这里任何写失败都只作为
+/// `Err` 返回而绝不 panic：接收方提前关闭管道（EPIPE）、fd 以只读
+/// 方式打开（EBADF）等情况下，调用方照常使用已经判定的退出码。
+/// 短写照常续写到同一 fd；EINTR 立即重试。这是“尽力”通道——调用方
+/// 总是忽略错误：已送出的字节保留，送不出去的内容不补齐。
+#[cfg(unix)]
+fn write_stderr_all(mut line: &[u8]) -> io::Result<()> {
+    use std::os::raw::c_void;
+    use std::os::fd::RawFd;
+
+    unsafe extern "C" {
+        fn write(fd: RawFd, buf: *const c_void, count: usize) -> isize;
+    }
+
+    const STDERR_FD: RawFd = 2;
+    while !line.is_empty() {
+        let written = unsafe { write(STDERR_FD, line.as_ptr().cast::<c_void>(), line.len()) };
+        if written < 0 {
+            let err = io::Error::last_os_error();
+            // 临时中断不代表任何字节的命运，原地重试。
+            if err.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(err);
+        }
+        let n = written as usize;
+        if n == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::WriteZero,
+                "write to standard error returned no progress",
+            ));
+        }
+        line = &line[n..];
+    }
+    Ok(())
+}
+
+/// 非 Unix 目标：标准库句柄不会因管道关闭而 panic，沿用加锁写入并显式刷新。
+#[cfg(not(unix))]
+fn write_stderr_all(line: &[u8]) -> io::Result<()> {
+    let stderr = io::stderr();
+    let mut handle = stderr.lock();
+    handle.write_all(line)?;
+    handle.flush()
+}
+
 /// 解析用户给出的预期摘要。
 ///
 /// 解析规则完全来自库（[`Sha256Digest::from_hex_bytes`]），与库的
@@ -165,8 +234,7 @@ fn run_check_digest(path: &Path, expected_arg: &OsStr) -> ExitCode {
     let expected = match parse_expected_digest(expected_arg) {
         Ok(digest) => digest,
         Err(reason) => {
-            eprintln!("inkseal: invalid expected digest: {reason}");
-            eprintln!("{USAGE}");
+            emit_usage_error(Some(&format!("inkseal: invalid expected digest: {reason}")));
             return ExitCode::from(2);
         }
     };
@@ -177,14 +245,14 @@ fn run_check_digest(path: &Path, expected_arg: &OsStr) -> ExitCode {
     let file = match File::open(path) {
         Ok(file) => file,
         Err(err) => {
-            eprintln!("inkseal: cannot open '{display}': {err}");
+            emit_error_line(&format!("inkseal: cannot open '{display}': {err}"));
             return ExitCode::FAILURE;
         }
     };
     let actual = match inkseal::digest_reader(file) {
         Ok(digest) => digest,
         Err(err) => {
-            eprintln!("inkseal: cannot read '{display}': {err}");
+            emit_error_line(&format!("inkseal: cannot read '{display}': {err}"));
             return ExitCode::FAILURE;
         }
     };
@@ -194,9 +262,9 @@ fn run_check_digest(path: &Path, expected_arg: &OsStr) -> ExitCode {
     } else {
         // 内容不匹配：预期与实际都用库的同一显示规则呈现为
         // 64 个小写十六进制字符（大小写混用的输入也规范为小写）。
-        eprintln!("inkseal: digest mismatch for '{display}'");
-        eprintln!("expected: {}", expected.to_hex());
-        eprintln!("actual:   {}", actual.to_hex());
+        emit_error_line(&format!("inkseal: digest mismatch for '{display}'"));
+        emit_error_line(&format!("expected: {}", expected.to_hex()));
+        emit_error_line(&format!("actual:   {}", actual.to_hex()));
         ExitCode::FAILURE
     }
 }

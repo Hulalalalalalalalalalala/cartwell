@@ -808,3 +808,311 @@ mod output_failures {
         assert!(!stderr.contains("unable to write to standard output"), "{stderr:?}");
     }
 }
+
+// ── 标准错误写入失败 ─────────────────────────────────────────────────────────
+//
+// 错误提示写给标准错误，而接收方可能把管道接到另一个程序、由该程序提前
+// 关闭。提示能否送达只影响“用户看不看得见原因”，绝不允许改变本次操作
+// 已有的结论：用法错误仍是 2，文件错误与摘要不匹配仍是 1，标准输出保持
+// 为空，且不能出现 Rust 的 panic 崩溃信息（那会使退出码变成 101）。
+
+#[cfg(unix)]
+mod stderr_failures {
+    use super::*;
+    use std::fs::OpenOptions;
+    use std::io::Read;
+    use std::os::fd::{FromRawFd, RawFd};
+    use std::os::raw::c_int;
+    use std::process::Stdio;
+
+    unsafe extern "C" {
+        fn pipe(pipefd: *mut RawFd) -> c_int;
+        fn fcntl(fd: RawFd, cmd: c_int, arg: c_int) -> c_int;
+    }
+
+    const F_GETFD: c_int = 1;
+    const F_SETFD: c_int = 2;
+    const FD_CLOEXEC: c_int = 1;
+
+    /// 给管道两端挂上 `FD_CLOEXEC`：读端必须留在父进程（稍后读几字节再关），
+    /// 但绝不能被子进程继承——否则子进程自己也持有读端，父进程关闭读端后
+    /// 管道仍有读者，子进程的写入永远收不到 EPIPE，测试就失去了意义。
+    fn set_cloexec(fd: RawFd) {
+        let flags = unsafe { fcntl(fd, F_GETFD, 0) };
+        assert!(flags >= 0, "fcntl F_GETFD failed");
+        let result = unsafe { fcntl(fd, F_SETFD, flags | FD_CLOEXEC) };
+        assert!(result >= 0, "fcntl F_SETFD failed");
+    }
+
+    /// 运行命令，标准输出走管道（供调用方核对始终为空），标准错误接到一个
+    /// 由父进程持有的管道：
+    /// - `drain = None`：一个字节都不读，立刻关闭读端——子进程的第一次
+    ///   `write` 就收到 EPIPE，模拟“从一开始就拒绝写入”。
+    /// - `drain = Some(n)`：先读出至多 `n` 个字节再关闭读端——子进程可能
+    ///   已送出提示开头，随后的写入失败，模拟“只收到部分提示”。
+    ///
+    /// 返回 `(Output, 已读到的部分字节)`。无论提示最终是否送达，退出码与
+    /// 标准输出都必须符合该操作本身的约定。
+    fn run_with_dying_stderr(args: &[&OsStr], drain: Option<usize>) -> (Output, Vec<u8>) {
+        let mut fds: [RawFd; 2] = [-1, -1];
+        assert_eq!(unsafe { pipe(fds.as_mut_ptr()) }, 0);
+        set_cloexec(fds[0]);
+        set_cloexec(fds[1]);
+        // 写端交给子进程作为标准错误（spawn 后父进程这份随之关闭）。
+        let stderr = Stdio::from(unsafe { std::fs::File::from_raw_fd(fds[1]) });
+        // 读端只用于“先读一点”的场景；其余情况下在 spawn 前就关掉，
+        // 保证子进程的第一次 write 必然面对没有读端的管道（EPIPE）。
+        let mut read_end = match drain {
+            None => {
+                drop(unsafe { std::fs::File::from_raw_fd(fds[0]) });
+                None
+            }
+            Some(_) => Some(unsafe { std::fs::File::from_raw_fd(fds[0]) }),
+        };
+
+        let child = inkseal()
+            .args(args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(stderr)
+            .spawn()
+            .expect("failed to spawn inkseal");
+
+        let mut drained = Vec::new();
+        if let (Some(read_end), Some(mut remaining)) = (read_end.as_mut(), drain) {
+            let mut buf = [0u8; 64];
+            while remaining > 0 {
+                let take = remaining.min(buf.len());
+                match read_end.read(&mut buf[..take]) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        drained.extend_from_slice(&buf[..n]);
+                        remaining -= n;
+                    }
+                    // 读端尚未关闭，这里不该出错；保守地结束排水。
+                    Err(_) => break,
+                }
+            }
+        }
+        // 关闭读端：仍在写提示的子进程此后得到 EPIPE。
+        drop(read_end);
+
+        let output = child
+            .wait_with_output()
+            .expect("failed to wait for inkseal");
+        (output, drained)
+    }
+
+    /// 以只读方式打开普通文件得到的 fd 作为标准错误：对它写入会被内核
+    /// 直接拒绝（EBADF），模拟“标准错误被重定向到拒绝写入的位置”。
+    fn read_only_stderr(path: &Path) -> Stdio {
+        let file = OpenOptions::new()
+            .read(true)
+            .write(false)
+            .open(path)
+            .expect("open read-only fd");
+        Stdio::from(file)
+    }
+
+    fn run_with_stderr(stderr: Stdio, args: &[&OsStr]) -> Output {
+        inkseal()
+            .args(args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(stderr)
+            .output()
+            .expect("failed to run inkseal")
+    }
+
+    /// 错误提示写不出去时的统一约定：以指定退出码正常结束，标准输出为空，
+    /// 已送出的少量字节里也不能夹带崩溃信息。
+    fn assert_clean_exit_with_code(
+        output: &Output,
+        drained: &[u8],
+        code: i32,
+        context: &str,
+    ) {
+        assert_eq!(
+            output.status.code(),
+            Some(code),
+            "{context}: exit code: {output:?}"
+        );
+        assert!(
+            output.stdout.is_empty(),
+            "{context}: failure hints must never move to stdout: {:?}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        let drained_text = String::from_utf8_lossy(drained);
+        assert!(
+            !drained_text.contains("panicked") && !drained_text.contains("RUST_BACKTRACE"),
+            "{context}: must terminate normally, no crash output: {drained_text:?}"
+        );
+    }
+
+    /// 用法类错误在各种标准错误失效方式下都必须保持退出码 2。
+    #[test]
+    fn usage_errors_keep_exit_code_2_when_stderr_dead() {
+        let usage_cases: &[&[&OsStr]] = &[
+            &[],
+            &[OsStr::new("frobnicate")],
+            &[OsStr::new("digest")],
+            &[OsStr::new("check-digest")],
+            &[OsStr::new("check-digest"), OsStr::new("whatever")],
+            // 多给参数同样是用法错误。
+            &[OsStr::new("digest"), OsStr::new("a"), OsStr::new("b")],
+        ];
+
+        for args in usage_cases {
+            let (output, drained) = run_with_dying_stderr(args, None);
+            assert_clean_exit_with_code(&output, &drained, 2, &format!("EPIPE args={args:?}"));
+
+            let (output, drained) = run_with_dying_stderr(args, Some(8));
+            assert_clean_exit_with_code(&output, &drained, 2, &format!("partial args={args:?}"));
+        }
+
+        // 摘要格式不合法 + 文件不存在：格式校验先于文件访问，提示写不
+        // 出去也必须以 2 结束，而不是降级为文件错误（1）或崩溃（101）。
+        let bad_digest: &[&OsStr] = &[
+            OsStr::new("check-digest"),
+            OsStr::new("does-not-exist"),
+            OsStr::new("abc"),
+        ];
+        let (output, drained) = run_with_dying_stderr(bad_digest, None);
+        assert_clean_exit_with_code(&output, &drained, 2, "invalid digest + missing file");
+    }
+
+    /// 文件无法打开 / 路径为目录 / 摘要不匹配在标准错误失效时保持退出码 1。
+    #[test]
+    fn file_errors_and_mismatch_keep_exit_code_1_when_stderr_dead() {
+        let dir = TestDir::new("stderr-dead-failures");
+        let file = dir.write_file(OsStr::new("hello.txt"), b"abc");
+        let missing = dir.path().join("nope.txt");
+        let directory = dir.path().join("a-directory");
+        fs::create_dir_all(&directory).unwrap();
+        let empty_hex = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+
+        let failure_cases: &[&[&OsStr]] = &[
+            &[OsStr::new("digest"), missing.as_os_str()],
+            &[OsStr::new("digest"), directory.as_os_str()],
+            &[
+                OsStr::new("check-digest"),
+                missing.as_os_str(),
+                OsStr::new(ABC_HEX),
+            ],
+            &[
+                OsStr::new("check-digest"),
+                directory.as_os_str(),
+                OsStr::new(ABC_HEX),
+            ],
+            // 摘要不匹配：三行提示中途写失败也不能改变结论。
+            &[
+                OsStr::new("check-digest"),
+                file.as_os_str(),
+                OsStr::new(empty_hex),
+            ],
+        ];
+
+        for args in failure_cases {
+            let (output, drained) = run_with_dying_stderr(args, None);
+            assert_clean_exit_with_code(&output, &drained, 1, &format!("EPIPE args={args:?}"));
+
+            // 只放行几字节便关闭：已发出的提示开头保留，退出码仍是 1。
+            let (output, drained) = run_with_dying_stderr(args, Some(16));
+            assert_clean_exit_with_code(&output, &drained, 1, &format!("partial args={args:?}"));
+            // 排水字节若有内容，应是错误提示本身的开头，而非崩溃信息。
+            if let Some(first) = drained.first() {
+                assert_eq!(first, &b'i', "hint starts with 'inkseal:': {drained:?}");
+            }
+        }
+    }
+
+    /// 标准错误被重定向到只读 fd（写入从第一次起就被拒绝）时同样不崩溃。
+    #[test]
+    fn read_only_stderr_still_preserves_exit_codes() {
+        let dir = TestDir::new("stderr-readonly");
+        let sink = dir.write_file(OsStr::new("sink"), b"");
+        let missing = dir.path().join("nope.txt");
+
+        let usage = run_with_read_only_stderr(&sink, &[OsStr::new("frobnicate")]);
+        assert_eq!(usage.status.code(), Some(2), "{usage:?}");
+        assert!(usage.stdout.is_empty());
+
+        let file_error =
+            run_with_read_only_stderr(&sink, &[OsStr::new("digest"), missing.as_os_str()]);
+        assert_eq!(file_error.status.code(), Some(1), "{file_error:?}");
+        assert!(file_error.stdout.is_empty());
+        let stderr = String::from_utf8_lossy(&file_error.stderr);
+        assert!(!stderr.contains("panicked"), "must not crash: {stderr:?}");
+    }
+
+    fn run_with_read_only_stderr(sink: &Path, args: &[&OsStr]) -> Output {
+        run_with_stderr(read_only_stderr(sink), args)
+    }
+
+    /// 标准错误不可用本身不影响成功操作：成功结果照常写到标准输出，
+    /// 退出码仍为 0。
+    #[test]
+    fn success_is_unaffected_by_dead_stderr() {
+        let dir = TestDir::new("stderr-dead-success");
+        let file = dir.write_file(OsStr::new("hello.txt"), b"abc");
+
+        let digest_line = format!("{ABC_HEX}\n");
+        let cases: &[(&[&OsStr], &[u8])] = &[
+            (&[OsStr::new("--version")], b"inkseal 0.1.0\n"),
+            (
+                &[OsStr::new("digest"), file.as_os_str()],
+                digest_line.as_bytes(),
+            ),
+            (
+                &[
+                    OsStr::new("check-digest"),
+                    file.as_os_str(),
+                    OsStr::new(ABC_HEX),
+                ],
+                b"OK\n",
+            ),
+        ];
+
+        for (args, expected_stdout) in cases {
+            let (output, _drained) = run_with_dying_stderr(args, None);
+            assert_eq!(output.status.code(), Some(0), "args={args:?}: {output:?}");
+            assert_eq!(
+                &output.stdout,
+                expected_stdout,
+                "success output must be delivered intact to stdout (args={args:?})"
+            );
+        }
+    }
+
+    /// 标准错误可写时，多行提示的内容与行结构完全不变——本测试只是把
+    /// “正常提示”与上面的“提示写失败”并排固定下来，防止重构写路径时
+    /// 顺手改动措辞或换行。
+    #[test]
+    fn writable_stderr_keeps_existing_message_shape() {
+        let dir = TestDir::new("stderr-writable-shape");
+        let missing = dir.path().join("nope.txt");
+
+        let usage = run_with_stderr(Stdio::piped(), &[OsStr::new("frobnicate")]);
+        assert_eq!(usage.status.code(), Some(2));
+        assert!(usage.stdout.is_empty());
+        assert_eq!(
+            String::from_utf8_lossy(&usage.stderr),
+            format!("{USAGE_TEXT}\n")
+        );
+
+        let open_fail = run_with_stderr(
+            Stdio::piped(),
+            &[OsStr::new("digest"), missing.as_os_str()],
+        );
+        assert_eq!(open_fail.status.code(), Some(1));
+        assert!(open_fail.stdout.is_empty());
+        let stderr = String::from_utf8_lossy(&open_fail.stderr);
+        assert!(stderr.starts_with("inkseal: cannot open '"), "{stderr:?}");
+        assert!(stderr.contains("nope.txt':"), "must name the path: {stderr:?}");
+        assert!(stderr.ends_with('\n'));
+        assert_eq!(stderr.trim_end_matches('\n').matches('\n').count(), 0);
+    }
+
+    /// 与二进制内置用法文本逐字一致的副本，用于可写标准错误下的行结构核对。
+    const USAGE_TEXT: &str = "Usage: inkseal --version\n       inkseal digest <file>\n       inkseal check-digest <file> <digest>";
+}
