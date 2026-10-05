@@ -64,7 +64,8 @@ fn run_digest(path: &Path) -> ExitCode {
 /// 解析用户给出的预期摘要：必须恰好是 64 个 ASCII 十六进制字符（大小写
 /// 均可），按其表示的 32 字节摘要值比较。不做任何空白裁剪——前缀、空格、
 /// 末尾换行、长度不对或含非十六进制字符都视为格式错误。参数无法解码为
-/// 合法文字同样视为格式错误。
+/// 合法文字同样视为格式错误。格式规则与库接口 [`inkseal::Sha256Digest`]
+/// 的文本解析完全一致。
 fn parse_expected_digest(arg: &OsStr) -> Result<[u8; 32], String> {
     let bytes = arg.as_encoded_bytes();
     if bytes.len() != 64 {
@@ -73,24 +74,14 @@ fn parse_expected_digest(arg: &OsStr) -> Result<[u8; 32], String> {
             bytes.len()
         ));
     }
-    let mut out = [0u8; 32];
-    for (i, pair) in bytes.chunks(2).enumerate() {
-        let hi = hex_nibble(pair[0])
-            .ok_or_else(|| "expected digest contains a non-hexadecimal character".to_string())?;
-        let lo = hex_nibble(pair[1])
-            .ok_or_else(|| "expected digest contains a non-hexadecimal character".to_string())?;
-        out[i] = (hi << 4) | lo;
-    }
-    Ok(out)
-}
-
-fn hex_nibble(b: u8) -> Option<u8> {
-    match b {
-        b'0'..=b'9' => Some(b - b'0'),
-        b'a'..=b'f' => Some(b - b'a' + 10),
-        b'A'..=b'F' => Some(b - b'A' + 10),
-        _ => None,
-    }
+    // 长度符合后交给库解析；无法解码为合法文字或含非十六进制字符
+    // 都归为同一类格式错误。
+    let Ok(text) = std::str::from_utf8(bytes) else {
+        return Err("expected digest contains a non-hexadecimal character".to_string());
+    };
+    text.parse::<inkseal::Sha256Digest>()
+        .map(|digest| *digest.as_bytes())
+        .map_err(|_| "expected digest contains a non-hexadecimal character".to_string())
 }
 
 fn run_check_digest(path: &Path, expected_arg: &OsStr) -> ExitCode {
