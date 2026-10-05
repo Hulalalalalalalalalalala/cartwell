@@ -96,6 +96,26 @@ fn hex_nibble(b: u8) -> Option<u8> {
     }
 }
 
+/// 十六进制摘要解析的唯一入口：逐字节解析 64 个 ASCII 十六进制字符。
+///
+/// 先按原始文本的字节长度判断：长度不是 64 时携带实际字节长度，不再检查
+/// 内容；长度为 64 时成对解码，携带首个非法字节从零开始的字节偏移
+/// （按字节计，不按字符个数），后面的错误不会覆盖前面的错误。
+fn parse_digest_bytes(bytes: &[u8]) -> Result<Sha256Digest, ParseDigestError> {
+    if bytes.len() != 64 {
+        return Err(ParseDigestError::InvalidLength(bytes.len()));
+    }
+    let mut out = [0u8; 32];
+    for (i, pair) in bytes.chunks_exact(2).enumerate() {
+        let hi = hex_nibble(pair[0])
+            .ok_or(ParseDigestError::InvalidHexChar(2 * i))?;
+        let lo = hex_nibble(pair[1])
+            .ok_or(ParseDigestError::InvalidHexChar(2 * i + 1))?;
+        out[i] = (hi << 4) | lo;
+    }
+    Ok(Sha256Digest(out))
+}
+
 impl std::str::FromStr for Sha256Digest {
     type Err = ParseDigestError;
 
@@ -106,19 +126,7 @@ impl std::str::FromStr for Sha256Digest {
     /// 分隔符以及全角数字等非 ASCII 内容都属于格式错误。长度按输入的
     /// UTF-8 字节数判断，非法字符的位置也按字节偏移报告。
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let bytes = s.as_bytes();
-        if bytes.len() != 64 {
-            return Err(ParseDigestError::InvalidLength(bytes.len()));
-        }
-        let mut out = [0u8; 32];
-        for (i, pair) in bytes.chunks_exact(2).enumerate() {
-            let hi = hex_nibble(pair[0])
-                .ok_or(ParseDigestError::InvalidHexChar(2 * i))?;
-            let lo = hex_nibble(pair[1])
-                .ok_or(ParseDigestError::InvalidHexChar(2 * i + 1))?;
-            out[i] = (hi << 4) | lo;
-        }
-        Ok(Sha256Digest(out))
+        parse_digest_bytes(s.as_bytes())
     }
 }
 
