@@ -6,7 +6,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-const USAGE: &str = "Usage: inkseal --version\n       inkseal digest <file>\n       inkseal check-digest <file> <digest>";
+const USAGE: &str = "Usage: inkseal --version\n       inkseal digest <file>\n       inkseal check-digest <file> <digest>\n       inkseal check-digest-file <file> <digest-file>";
 
 fn main() -> ExitCode {
     // 使用 args_os 而非 args：命令行参数是操作系统给出的原始字节，
@@ -34,6 +34,21 @@ fn main() -> ExitCode {
                 );
             };
             run_check_digest(Path::new(&path), &expected)
+        }
+        Some(ref cmd) if cmd.as_encoded_bytes() == b"check-digest-file" => {
+            let (Some(path), Some(digest_path), None) = (args.next(), args.next(), args.next())
+            else {
+                return emit_error(
+                    2,
+                    format!(
+                        "inkseal: check-digest-file requires exactly two arguments: \
+                         <file> <digest-file>\n\
+                         {USAGE}\n"
+                    )
+                    .as_bytes(),
+                );
+            };
+            run_check_digest_file(Path::new(&path), Path::new(&digest_path))
         }
         _ => {
             // 未知子命令（即便含有非 UTF-8 字节）等用法错误统一走这里。
@@ -245,6 +260,15 @@ fn run_check_digest(path: &Path, expected_arg: &OsStr) -> ExitCode {
         }
     };
 
+    finish_digest_check(path, expected)
+}
+
+/// 预期摘要已确认合法后，核对 `path` 的实际内容并按既有的唯一一套规则
+/// 输出：匹配写 `OK\n`（完整交付后以 0 退出）；访问失败报告文件原因；
+/// 不匹配列出小写的预期与实际摘要。`check-digest` 与
+/// `check-digest-file` 在拿到合法摘要之后共用本函数，因此两者对待核对
+/// 文件的原始字节、流式读取、比较与输出规则完全一致。
+fn finish_digest_check(path: &Path, expected: Sha256Digest) -> ExitCode {
     // 与 digest 共用同一条文件访问规则；访问失败是文件问题，
     // 绝不能被解释成内容不匹配。
     let actual = match digest_file(path) {
@@ -270,6 +294,157 @@ fn run_check_digest(path: &Path, expected_arg: &OsStr) -> ExitCode {
             .as_bytes(),
         )
     }
+}
+
+/// 读取并解析摘要文件时的失败。
+///
+/// 前两类是摘要文件本身的访问问题（以 `1` 退出）；[`Malformed`](Self::Malformed)
+/// 是内容不符合“恰好一份摘要”的格式约定（以 `2` 退出）。三类都必须在
+/// 待核对文件被访问之前判定，且提示里都要带上摘要文件自己的路径，绝不
+/// 能把摘要文件的问题改报成待核对文件的访问错误。
+enum DigestFileError {
+    /// 摘要文件无法打开（不存在、权限不足等）。
+    Open(PathBuf, io::Error),
+    /// 摘要文件已打开但读取中途失败（含路径指向目录时的读取错误）。
+    Read(PathBuf, io::Error),
+    /// 摘要文件内容不符合格式约定。
+    Malformed(PathBuf, DigestFileProblem),
+}
+
+/// 摘要文件内容的具体格式问题，用于给出精确的错误原因。
+enum DigestFileProblem {
+    /// 空文件：连一个摘要字符都没有。
+    Empty,
+    /// 内容超过“64 个十六进制字符 + 单个 CRLF”的 66 字节上限：
+    /// 多余字节可能是第二份摘要、文件名或任何附加内容，一律拒绝。
+    TooLong,
+    /// 去掉唯一允许的末尾换行后，摘要正文未通过库的严格十六进制解析。
+    InvalidDigest(ParseDigestError),
+}
+
+impl DigestFileProblem {
+    /// 渲染为人类可读的具体格式原因（不含路径，路径由调用方添加）。
+    fn description(&self) -> String {
+        const RULE: &str = concat!(
+            "the digest file must contain exactly one digest of 64 ASCII ",
+            "hexadecimal characters, optionally followed by one LF or CRLF"
+        );
+        match self {
+            DigestFileProblem::Empty => {
+                format!("{RULE}, but the file is empty")
+            }
+            DigestFileProblem::TooLong => {
+                format!("{RULE}, but the file contains extra bytes beyond that single line")
+            }
+            DigestFileProblem::InvalidDigest(ParseDigestError::InvalidLength(len)) => {
+                format!(
+                    "{RULE}; the digest text is {len} bytes long (before any trailing newline)"
+                )
+            }
+            DigestFileProblem::InvalidDigest(ParseDigestError::InvalidHexChar(pos)) => {
+                format!(
+                    "{RULE}; the digest text contains a non-hexadecimal byte at offset {pos} \
+                    (only 0-9, a-f and A-F are allowed)"
+                )
+            }
+        }
+    }
+}
+
+/// 打开摘要文件、读取其（被严格限长的）全部内容并解析为摘要值。
+///
+/// 合法文件至多 66 字节：64 个十六进制字符，末尾可带一个 LF 或 CRLF。
+/// 这里最多读入 67 字节——多出的第 67 字节是“内容超长”的确定性哨兵，
+/// 因此内存占用恒定，也不必把可能很大的非法文件（例如误指向二进制或
+/// 第二份摘要）整个读完就能判定格式错误。读取本身失败与内容格式不合法
+/// 是两类不同的失败，分别映射到 [`DigestFileError`] 的不同变体。
+fn load_expected_digest_file(path: &Path) -> Result<Sha256Digest, DigestFileError> {
+    use std::io::Read as _;
+
+    let file = File::open(path)
+        .map_err(|err| DigestFileError::Open(path.to_path_buf(), err))?;
+
+    let mut content = Vec::with_capacity(67);
+    file.take(67)
+        .read_to_end(&mut content)
+        .map_err(|err| DigestFileError::Read(path.to_path_buf(), err))?;
+
+    parse_digest_file_content(&content)
+        .map_err(|problem| DigestFileError::Malformed(path.to_path_buf(), problem))
+}
+
+/// 摘要文件内容的唯一解析规则。
+///
+/// 与 `check-digest` 的摘要参数不同，摘要文件允许结尾带一个换行：内容
+/// 要么恰好是 64 个十六进制字符，要么在其后紧跟一个 LF 或 CRLF。除此之外
+/// 不做任何裁剪或修正——空文件、首尾空格、单独的 CR、额外空行、第二份
+/// 摘要、附带的文件名、`0x` 前缀或非 ASCII 字节都属于格式错误。剥离唯一
+/// 允许的行结束后，正文仍必须通过库的严格解析
+/// （[`Sha256Digest::from_hex_bytes`]），其严格格式不在此放宽。
+fn parse_digest_file_content(content: &[u8]) -> Result<Sha256Digest, DigestFileProblem> {
+    if content.is_empty() {
+        return Err(DigestFileProblem::Empty);
+    }
+    if content.len() > 66 {
+        return Err(DigestFileProblem::TooLong);
+    }
+
+    // 仅当 LF 是最后一个字节时剥离它；剥到 LF 后，再仅当 CR 紧接在它
+    // 前面（即结尾确为 CRLF）时剥离该 CR。顺序保证：单独的 CR、CRLF
+    // 之外的任何尾随字节都不会被裁掉——例如 "\n\r" 的末字节是 CR，
+    // 第一步就不匹配，整体按长度错误拒绝。
+    let mut hex: &[u8] = content;
+    if let Some(rest) = hex.strip_suffix(b"\n") {
+        hex = rest;
+        if let Some(rest) = hex.strip_suffix(b"\r") {
+            hex = rest;
+        }
+    }
+
+    Sha256Digest::from_hex_bytes(hex).map_err(DigestFileProblem::InvalidDigest)
+}
+
+fn run_check_digest_file(path: &Path, digest_path: &Path) -> ExitCode {
+    // 先完整处理摘要文件：在它被成功打开、读取并确认格式合法之前，
+    // 绝不访问待核对文件——即使待核对文件不存在，也不得改报它的错误。
+    let expected = match load_expected_digest_file(digest_path) {
+        Ok(digest) => digest,
+        Err(DigestFileError::Open(p, err)) => {
+            return emit_error(
+                1,
+                format!(
+                    "inkseal: cannot open digest file '{}': {err}\n",
+                    path_display(&p)
+                )
+                .as_bytes(),
+            );
+        }
+        Err(DigestFileError::Read(p, err)) => {
+            return emit_error(
+                1,
+                format!(
+                    "inkseal: cannot read digest file '{}': {err}\n",
+                    path_display(&p)
+                )
+                .as_bytes(),
+            );
+        }
+        Err(DigestFileError::Malformed(p, problem)) => {
+            return emit_error(
+                2,
+                format!(
+                    "inkseal: malformed digest file '{}': {}\n{USAGE}\n",
+                    path_display(&p),
+                    problem.description()
+                )
+                .as_bytes(),
+            );
+        }
+    };
+
+    // 摘要文件合法后才打开待核对文件；其后的访问、比较与输出规则与
+    // check-digest 完全一致（共用 finish_digest_check）。
+    finish_digest_check(path, expected)
 }
 
 /// 生成可安全输出到标准错误的路径文本：不可解码的字节以替换字符

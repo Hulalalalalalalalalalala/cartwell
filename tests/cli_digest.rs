@@ -632,6 +632,358 @@ fn check_digest_non_utf8_digest_argument_is_usage_error_without_opening_file() {
     assert!(!stderr.contains("cannot open"), "{stderr:?}");
 }
 
+// ── check-digest-file ────────────────────────────────────────────────────────
+
+fn run_check_file(path: &OsStr, digest_file: &OsStr) -> Output {
+    inkseal()
+        .arg("check-digest-file")
+        .arg(path)
+        .arg(digest_file)
+        .output()
+        .expect("failed to run inkseal")
+}
+
+/// 摘要文件格式错误的完整约定：退出码 2、标准输出为空，标准错误首先指出
+/// 摘要文件（而非待核对文件）及其格式问题并给出用法；此时即使待核对文件
+/// 不存在，也不能改报它的访问错误。
+fn assert_malformed_digest_file(
+    output: &Output,
+    digest_name: &str,
+    target_name: &str,
+) -> String {
+    assert_eq!(output.status.code(), Some(2), "exit code: {output:?}");
+    assert!(
+        output.stdout.is_empty(),
+        "stdout must be empty on malformed digest file: {:?}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let stderr = String::from_utf8(output.stderr.clone()).expect("stderr must be UTF-8");
+    assert!(
+        stderr.starts_with("inkseal: malformed digest file '"),
+        "must report the digest file as malformed: {stderr:?}"
+    );
+    assert!(
+        stderr.contains(digest_name),
+        "error must name the digest file {digest_name:?}: {stderr:?}"
+    );
+    assert!(
+        stderr.contains("Usage:"),
+        "usage for the new command must be shown: {stderr:?}"
+    );
+    assert!(
+        stderr.contains("check-digest-file <file> <digest-file>"),
+        "usage must include the new command: {stderr:?}"
+    );
+    // 摘要文件格式问题先于待核对文件处理：不得报告待核对文件的访问问题，
+    // 提示里也不应出现待核对文件的名字。
+    assert!(
+        !stderr.contains("cannot open") && !stderr.contains("cannot read"),
+        "digest file must be validated before touching the target (case {digest_name:?}): {stderr:?}"
+    );
+    assert!(
+        !stderr.contains(target_name),
+        "target must not be accessed or named (case {digest_name:?}): {stderr:?}"
+    );
+    stderr
+}
+
+#[test]
+fn check_digest_file_uses_digest_command_output_directly() {
+    let dir = TestDir::new("cdf-workflow");
+    let path = dir.write_file(OsStr::new("hello.txt"), b"abc");
+    let digest_path = dir.path().join("hello.sha256");
+
+    // 文档中的典型用法：digest 的摘要行直接重定向保存到文件。
+    let digest_out = std::fs::File::create(&digest_path).expect("create digest file");
+    let status = inkseal()
+        .arg("digest")
+        .arg(&path)
+        .stdout(digest_out)
+        .status()
+        .expect("run digest");
+    assert!(status.success());
+    assert_eq!(fs::read(&digest_path).unwrap(), format!("{ABC_HEX}\n").as_bytes());
+
+    // 保存下来的摘要行必须能直接用于核对，无需复制字符串。
+    assert_check_ok(&run_check_file(path.as_os_str(), digest_path.as_os_str()));
+}
+
+#[test]
+fn check_digest_file_accepts_no_newline_lf_and_crlf_and_mixed_case() {
+    let dir = TestDir::new("cdf-endings");
+    let path = dir.write_file(OsStr::new("hello.txt"), b"abc");
+
+    let upper: String = ABC_HEX.to_uppercase();
+    let mixed: String = ABC_HEX
+        .chars()
+        .enumerate()
+        .map(|(i, c)| if i % 2 == 0 { c.to_ascii_uppercase() } else { c })
+        .collect();
+
+    let cases: Vec<Vec<u8>> = vec![
+        ABC_HEX.as_bytes().to_vec(),                // 末尾无换行
+        format!("{ABC_HEX}\n").into_bytes(),        // 单个 LF
+        format!("{ABC_HEX}\r\n").into_bytes(),      // 单个 CRLF
+        format!("{upper}\n").into_bytes(),          // 全大写 + LF，按值比较
+        format!("{mixed}\r\n").into_bytes(),        // 大小写混用 + CRLF
+    ];
+    for (i, contents) in cases.iter().enumerate() {
+        let digest_path = dir.write_file(OsStr::new(&format!("digest-{i}.txt")), contents);
+        assert_check_ok(&run_check_file(path.as_os_str(), digest_path.as_os_str()));
+    }
+}
+
+#[test]
+fn check_digest_file_works_for_empty_binary_and_large_files() {
+    let dir = TestDir::new("cdf-content");
+
+    let empty = dir.write_file(OsStr::new("empty"), b"");
+    let empty_hex = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+    let empty_digest = dir.write_file(
+        OsStr::new("empty.sha256"),
+        format!("{empty_hex}\n").as_bytes(),
+    );
+    assert_check_ok(&run_check_file(empty.as_os_str(), empty_digest.as_os_str()));
+
+    let binary = dir.write_file(OsStr::new("blob.bin"), &binary_content());
+    let binary_digest = dir.write_file(
+        OsStr::new("blob.sha256"),
+        format!("{BINARY_HEX}\n").as_bytes(),
+    );
+    assert_check_ok(&run_check_file(binary.as_os_str(), binary_digest.as_os_str()));
+
+    // 大文件仍以流式读取，规则与 check-digest 相同。
+    let data: Vec<u8> = (0..(5 * 64 * 1024 + 777))
+        .map(|i| ((i * 31 + 7) % 256) as u8)
+        .collect();
+    let large = dir.write_file(OsStr::new("large.bin"), &data);
+    let large_hex = inkseal::digest_reader(&data[..]).unwrap().to_hex();
+    let large_digest = dir.write_file(
+        OsStr::new("large.sha256"),
+        format!("{large_hex}\n").as_bytes(),
+    );
+    assert_check_ok(&run_check_file(large.as_os_str(), large_digest.as_os_str()));
+}
+
+#[test]
+fn check_digest_file_mismatch_lists_both_digests_lowercase() {
+    let dir = TestDir::new("cdf-mismatch");
+    let path = dir.write_file(OsStr::new("hello.txt"), b"abc");
+    let empty_hex = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+
+    // 文件是 "abc"，摘要文件里保存的却是空文件的摘要。
+    let digest_path =
+        dir.write_file(OsStr::new("hello.sha256"), format!("{empty_hex}\n").as_bytes());
+    let stderr = assert_mismatch(&run_check_file(path.as_os_str(), digest_path.as_os_str()), empty_hex, ABC_HEX);
+    assert!(!stderr.contains("cannot open"));
+    assert!(!stderr.contains("cannot read"));
+
+    // 摘要文件中用大写书写时，预期值仍以小写列出。
+    let upper_path = dir.write_file(
+        OsStr::new("upper.sha256"),
+        format!("{}\n", empty_hex.to_uppercase()).as_bytes(),
+    );
+    let stderr =
+        assert_mismatch(&run_check_file(path.as_os_str(), upper_path.as_os_str()), empty_hex, ABC_HEX);
+    assert!(stderr.contains(empty_hex));
+    assert!(!stderr.contains(&empty_hex.to_uppercase()));
+}
+
+#[test]
+fn check_digest_file_rejects_every_malformed_digest_file_before_touching_target() {
+    let dir = TestDir::new("cdf-malformed");
+    let target = dir.write_file(OsStr::new("target.bin"), b"abc");
+    let missing_target = dir.path().join("missing-target.bin");
+
+    // 除“64 个十六进制字符，末尾无/单个 LF/单个 CRLF”之外的一切形态
+    // 都属于格式错误：不裁剪、不修正、不只取第一行。
+    // 长度恰好 64 但末字节为非 ASCII：非法字符而不是长度错误。
+    let mut non_ascii = ABC_HEX.as_bytes().to_vec();
+    non_ascii[63] = 0xff;
+    let cases: Vec<(&str, Vec<u8>)> = vec![
+        ("empty", b"".to_vec()),                                                  // 空文件
+        ("short", b"abc".to_vec()),                                               // 太短
+        ("hex63", ABC_HEX[..63].as_bytes().to_vec()),                           // 63 个
+        ("hex63-lf", [ABC_HEX[..63].as_bytes(), b"\n"].concat()),                 // 63 个 + LF
+        ("hex65", format!("{ABC_HEX}a").into_bytes()),                            // 65 个
+        ("leading-space", format!(" {ABC_HEX}").into_bytes()),                    // 首部空格
+        ("trailing-space", format!("{ABC_HEX} ").into_bytes()),                   // 尾部空格
+        ("trailing-tab", format!("{ABC_HEX}\t").into_bytes()),                    // 尾部制表符
+        ("lone-cr", format!("{ABC_HEX}\r").into_bytes()),                         // 单独的 CR
+        ("two-lfs", format!("{ABC_HEX}\n\n").into_bytes()),                       // 额外空行
+        ("cr-lf-lf", format!("{ABC_HEX}\r\n\n").into_bytes()),                    // CRLF 后又一空行
+        ("lf-cr", format!("{ABC_HEX}\n\r").into_bytes()),                         // LF 后单独 CR
+        ("prefix-0x", format!("0x{ABC_HEX}").into_bytes()),                       // 0x 前缀
+        ("with-filename", format!("{ABC_HEX}  hello.txt").into_bytes()),          // 附带文件名
+        ("second-digest-line", format!("{ABC_HEX}\n{ABC_HEX}\n").into_bytes()),   // 第二份摘要
+        ("two-digests-runon", format!("{ABC_HEX}{ABC_HEX}").into_bytes()),        // 128 个字符
+        ("crlf-extra-byte", format!("{ABC_HEX}\r\nx").into_bytes()),              // CRLF 后多余字节
+        ("lf-filename", format!("{ABC_HEX}\nhello.txt").into_bytes()),            // LF 后附带文件名
+        (
+            "non-hex-char",
+            b"ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ag".to_vec(),
+        ),
+        ("non-ascii-byte", non_ascii),
+    ];
+
+    for (name, bad) in &cases {
+        let digest_path = dir.write_file(OsStr::new(&format!("{name}.sha256")), bad);
+
+        // 待核对文件存在：先报摘要文件格式错误（退出码 2），绝不比较内容。
+        assert_malformed_digest_file(
+            &run_check_file(target.as_os_str(), digest_path.as_os_str()),
+            &format!("{name}.sha256"),
+            "target.bin",
+        );
+
+        // 待核对文件不存在时同样如此：不能改报待核对文件的访问错误。
+        assert_malformed_digest_file(
+            &run_check_file(missing_target.as_os_str(), digest_path.as_os_str()),
+            &format!("{name}.sha256"),
+            "missing-target.bin",
+        );
+    }
+}
+
+#[test]
+fn check_digest_file_missing_digest_file_is_exit_1_without_comparison() {
+    let dir = TestDir::new("cdf-missing-digest");
+    let target = dir.write_file(OsStr::new("target.bin"), b"abc");
+    // 待核对文件同样不存在：只能报摘要文件的访问错误。
+    let missing_target = dir.path().join("missing-target.bin");
+    let missing_digest = dir.path().join("missing.sha256");
+
+    for t in [target.as_os_str(), missing_target.as_os_str()] {
+        let output = run_check_file(t, missing_digest.as_os_str());
+        let stderr = assert_failure(&output);
+        assert!(stderr.contains("cannot open digest file"), "{stderr:?}");
+        assert!(stderr.contains("missing.sha256"), "{stderr:?}");
+        assert!(!stderr.contains("missing-target.bin"), "{stderr:?}");
+        assert!(!stderr.to_lowercase().contains("mismatch"), "{stderr:?}");
+        assert!(!stderr.contains(ABC_HEX), "{stderr:?}");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn check_digest_file_unreadable_digest_file_is_open_failure() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = TestDir::new("cdf-unreadable");
+    let target = dir.write_file(OsStr::new("target.bin"), b"abc");
+    let digest_path = dir.write_file(OsStr::new("secret.sha256"), ABC_HEX.as_bytes());
+
+    // root 会绕过文件权限，此场景无意义；普通用户下去掉所有读权限，
+    // 打开即被拒绝。
+    let uid = Command::new("id").arg("-u").output().ok();
+    if uid.is_none_or(|o| String::from_utf8_lossy(&o.stdout).trim() == "0") {
+        return;
+    }
+
+    let mut perms = fs::metadata(&digest_path).unwrap().permissions();
+    perms.set_mode(0o000);
+    fs::set_permissions(&digest_path, perms).unwrap();
+
+    let output = run_check_file(target.as_os_str(), digest_path.as_os_str());
+    let stderr = assert_failure(&output);
+    assert!(stderr.contains("cannot open digest file"), "{stderr:?}");
+    assert!(stderr.contains("secret.sha256"), "{stderr:?}");
+}
+
+#[test]
+fn check_digest_file_directory_digest_file_is_read_failure() {
+    let dir = TestDir::new("cdf-digest-dir");
+    let target = dir.write_file(OsStr::new("target.bin"), b"abc");
+    let digest_dir = dir.path().join("a-digest-dir");
+    fs::create_dir_all(&digest_dir).unwrap();
+
+    let output = run_check_file(target.as_os_str(), digest_dir.as_os_str());
+
+    // 目录能打开但不可作为摘要文件读取：退出码 1，指出摘要文件与原因，
+    // 不是格式错误（退出码 2），也不进入内容比较。
+    let stderr = assert_failure(&output);
+    assert!(stderr.contains("digest file"), "{stderr:?}");
+    assert!(stderr.contains("a-digest-dir"), "{stderr:?}");
+    assert!(!stderr.to_lowercase().contains("mismatch"), "{stderr:?}");
+    assert_eq!(output.status.code(), Some(1));
+}
+
+#[test]
+fn check_digest_file_target_access_failure_names_target_not_mismatch() {
+    let dir = TestDir::new("cdf-target-fail");
+    let digest_path = dir.write_file(OsStr::new("hello.sha256"), format!("{ABC_HEX}\n").as_bytes());
+
+    // 待核对文件不存在：报告待核对文件，不能给出实际摘要或称为不匹配。
+    let missing = dir.path().join("nope.txt");
+    let output = run_check_file(missing.as_os_str(), digest_path.as_os_str());
+    let stderr = assert_failure(&output);
+    assert!(stderr.contains("cannot open"), "{stderr:?}");
+    assert!(stderr.contains("nope.txt"), "{stderr:?}");
+    assert!(!stderr.contains("hello.sha256"), "{stderr:?}");
+    assert!(!stderr.to_lowercase().contains("mismatch"), "{stderr:?}");
+    assert!(!stderr.contains(ABC_HEX), "{stderr:?}");
+
+    // 待核对文件指向目录：读取失败同样报告待核对文件。
+    let sub = dir.path().join("a-directory");
+    fs::create_dir_all(&sub).unwrap();
+    let output = run_check_file(sub.as_os_str(), digest_path.as_os_str());
+    let stderr = assert_failure(&output);
+    assert!(stderr.contains("a-directory"), "{stderr:?}");
+    assert!(!stderr.to_lowercase().contains("mismatch"), "{stderr:?}");
+}
+
+#[test]
+fn check_digest_file_missing_and_extra_arguments_are_usage_errors() {
+    let dir = TestDir::new("cdf-arity");
+    let path = dir.write_file(OsStr::new("f"), b"abc");
+    let digest_path = dir.write_file(OsStr::new("f.sha256"), ABC_HEX.as_bytes());
+
+    assert_usage_error(&run_args(&[OsStr::new("check-digest-file")]));
+    assert_usage_error(&run_args(&[
+        OsStr::new("check-digest-file"),
+        path.as_os_str(),
+    ]));
+
+    let output = inkseal()
+        .arg("check-digest-file")
+        .arg(&path)
+        .arg(&digest_path)
+        .arg("extra")
+        .output()
+        .unwrap();
+    assert_usage_error(&output);
+}
+
+#[test]
+fn check_digest_file_does_not_modify_inputs_or_create_result_files() {
+    let dir = TestDir::new("cdf-readonly");
+    let path = dir.write_file(OsStr::new("f"), b"abc");
+    let digest_path = dir.write_file(OsStr::new("f.sha256"), format!("{ABC_HEX}\n").as_bytes());
+    let target_before = fs::read(&path).unwrap();
+    let digest_before = fs::read(&digest_path).unwrap();
+
+    assert_check_ok(&run_check_file(path.as_os_str(), digest_path.as_os_str()));
+
+    assert_eq!(fs::read(&path).unwrap(), target_before, "target file bytes must be untouched");
+    assert_eq!(fs::read(&digest_path).unwrap(), digest_before, "digest file must be untouched");
+    // 只有两个输入文件，不产生任何结果文件。
+    assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 2);
+}
+
+#[cfg(unix)]
+#[test]
+fn check_digest_file_accepts_non_utf8_paths_for_both_arguments() {
+    use std::os::unix::ffi::OsStrExt;
+    let dir = TestDir::new("cdf-non-utf8");
+    let path = dir.write_file(OsStr::from_bytes(b"raw \xff\xfe target.bin"), b"abc");
+    let digest_path = dir.write_file(
+        OsStr::from_bytes(b"raw \xff digest.sha256"),
+        format!("{ABC_HEX}\n").as_bytes(),
+    );
+
+    assert_check_ok(&run_check_file(path.as_os_str(), digest_path.as_os_str()));
+}
+
 // ── 标准输出写入失败 ─────────────────────────────────────────────────────────
 
 #[cfg(unix)]
@@ -737,6 +1089,28 @@ mod output_failures {
 
         let stderr = assert_output_failure(&output);
         // 不能补写成功标记，也不能误报为不匹配。
+        assert!(!stderr.to_lowercase().contains("mismatch"), "{stderr:?}");
+        assert!(!stderr.contains("OK"), "must not echo success marker to stderr: {stderr:?}");
+    }
+
+    #[test]
+    fn check_digest_file_match_but_not_delivered_is_still_a_failure() {
+        let dir = TestDir::new("check-file-dead-pipe");
+        let path = dir.write_file(OsStr::new("hello.txt"), b"abc");
+        // 摘要文件正是 digest 的输出形态（64 个小写十六进制字符加 LF）。
+        let digest_path = dir.write_file(OsStr::new("hello.sha256"), format!("{ABC_HEX}\n").as_bytes());
+
+        let output = run_with_stdout(
+            closed_pipe_stdout(),
+            &[
+                OsStr::new("check-digest-file"),
+                path.as_os_str(),
+                digest_path.as_os_str(),
+            ],
+        );
+
+        // 与 check-digest 完全相同的输出失败规则。
+        let stderr = assert_output_failure(&output);
         assert!(!stderr.to_lowercase().contains("mismatch"), "{stderr:?}");
         assert!(!stderr.contains("OK"), "must not echo success marker to stderr: {stderr:?}");
     }
@@ -869,6 +1243,9 @@ mod stderr_failures {
         let dir = TestDir::new("stderr-usage");
         let file = dir.write_file(OsStr::new("real.txt"), b"abc");
         let missing = dir.path().join("does-not-exist");
+        // 内容非法的摘要文件：即便待核对文件不存在，也必须在访问它之前
+        // 判定为用法错误（退出码 2）。
+        let bad_digest_file = dir.write_file(OsStr::new("bad.sha256"), b"not-a-digest");
 
         let cases: Vec<Vec<&OsStr>> = vec![
             vec![],                                              // 无参数
@@ -887,6 +1264,15 @@ mod stderr_failures {
                 OsStr::new("check-digest"),
                 missing.as_os_str(),
                 OsStr::new("abc"),
+            ],
+            vec![OsStr::new("check-digest-file")],              // 缺少两个参数
+            vec![OsStr::new("check-digest-file"), file.as_os_str()], // 缺少摘要文件参数
+            vec![
+                // 新命令同样先处理摘要文件：内容非法时即使待核对文件不存在，
+                // 也是退出码 2，且不访问待核对文件。
+                OsStr::new("check-digest-file"),
+                missing.as_os_str(),
+                bad_digest_file.as_os_str(),
             ],
         ];
 
@@ -921,6 +1307,14 @@ mod stderr_failures {
         fs::create_dir_all(&subdir).unwrap();
         let empty_hex =
             "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+        // 摘要文件：一份合法（digest 输出形态），一份不存在，一份是目录。
+        let valid_digest_file =
+            dir.write_file(OsStr::new("valid.sha256"), format!("{ABC_HEX}\n").as_bytes());
+        let empty_digest_file =
+            dir.write_file(OsStr::new("empty.sha256"), format!("{empty_hex}\n").as_bytes());
+        let missing_digest = dir.path().join("missing.sha256");
+        let digest_subdir = dir.path().join("digest-dir");
+        fs::create_dir_all(&digest_subdir).unwrap();
 
         let cases: Vec<Vec<&OsStr>> = vec![
             vec![OsStr::new("digest"), missing.as_os_str()],
@@ -939,6 +1333,36 @@ mod stderr_failures {
                 OsStr::new("check-digest"),
                 file.as_os_str(),
                 OsStr::new(empty_hex),
+            ],
+            // 摘要文件本身无法打开：退出码 1，与待核对文件无关。
+            vec![
+                OsStr::new("check-digest-file"),
+                file.as_os_str(),
+                missing_digest.as_os_str(),
+            ],
+            // 摘要文件指向目录（读取失败）：退出码 1。
+            vec![
+                OsStr::new("check-digest-file"),
+                file.as_os_str(),
+                digest_subdir.as_os_str(),
+            ],
+            // 摘要文件合法但待核对文件无法打开。
+            vec![
+                OsStr::new("check-digest-file"),
+                missing.as_os_str(),
+                valid_digest_file.as_os_str(),
+            ],
+            // 摘要文件合法但待核对文件是目录。
+            vec![
+                OsStr::new("check-digest-file"),
+                subdir.as_os_str(),
+                valid_digest_file.as_os_str(),
+            ],
+            // 摘要文件合法、待核对文件可读但内容不匹配。
+            vec![
+                OsStr::new("check-digest-file"),
+                file.as_os_str(),
+                empty_digest_file.as_os_str(),
             ],
         ];
 
@@ -991,6 +1415,9 @@ mod stderr_failures {
     fn success_is_unaffected_when_stderr_is_dead() {
         let dir = TestDir::new("stderr-dead-success");
         let path = dir.write_file(OsStr::new("hello.txt"), b"abc");
+        // digest 输出形态的摘要文件：64 个小写十六进制字符加 LF。
+        let digest_path =
+            dir.write_file(OsStr::new("hello.sha256"), format!("{ABC_HEX}\n").as_bytes());
 
         let version = run_with_stderr(closed_pipe_stderr(), &[OsStr::new("--version")]);
         assert_eq!(version.status.code(), Some(0), "{version:?}");
@@ -1014,6 +1441,18 @@ mod stderr_failures {
         );
         assert_eq!(check.status.code(), Some(0), "{check:?}");
         assert_eq!(check.stdout, b"OK\n", "{check:?}");
+
+        // check-digest-file 核对通过同样只取决于标准输出。
+        let check_file = run_with_stderr(
+            closed_pipe_stderr(),
+            &[
+                OsStr::new("check-digest-file"),
+                path.as_os_str(),
+                digest_path.as_os_str(),
+            ],
+        );
+        assert_eq!(check_file.status.code(), Some(0), "{check_file:?}");
+        assert_eq!(check_file.stdout, b"OK\n", "{check_file:?}");
     }
 
     /// 成功结果无法写到标准输出、且连输出失败提示也无法写到标准错误时，
@@ -1022,6 +1461,8 @@ mod stderr_failures {
     fn undeliverable_success_with_both_streams_dead_is_silent_exit_1() {
         let dir = TestDir::new("both-dead");
         let path = dir.write_file(OsStr::new("hello.txt"), b"abc");
+        let digest_path =
+            dir.write_file(OsStr::new("hello.sha256"), format!("{ABC_HEX}\n").as_bytes());
 
         let cases: Vec<Vec<&OsStr>> = vec![
             vec![OsStr::new("--version")],
@@ -1030,6 +1471,11 @@ mod stderr_failures {
                 OsStr::new("check-digest"),
                 path.as_os_str(),
                 OsStr::new(ABC_HEX),
+            ],
+            vec![
+                OsStr::new("check-digest-file"),
+                path.as_os_str(),
+                digest_path.as_os_str(),
             ],
         ];
         for args in cases {
@@ -1690,7 +2136,7 @@ pub unsafe extern "C" fn write(fd: c_int, buf: *const c_void, count: usize) -> i
     }
 
     /// 用法提示的完整文本（与命令实现中的 USAGE 常量加末尾换行一致）。
-    const USAGE_TEXT: &str = "Usage: inkseal --version\n       inkseal digest <file>\n       inkseal check-digest <file> <digest>\n";
+    const USAGE_TEXT: &str = "Usage: inkseal --version\n       inkseal digest <file>\n       inkseal check-digest <file> <digest>\n       inkseal check-digest-file <file> <digest-file>\n";
 
     #[test]
     fn digest_line_fully_delivered_through_interruptions_and_short_writes() {
@@ -1740,6 +2186,28 @@ pub unsafe extern "C" fn write(fd: c_int, buf: *const c_void, count: usize) -> i
                 OsStr::new("check-digest"),
                 path.as_os_str(),
                 OsStr::new(ABC_HEX),
+            ],
+        );
+
+        assert_eq!(output.status.code(), Some(0), "{output:?}");
+        assert_eq!(output.stdout, b"OK\n", "{output:?}");
+        assert!(output.stderr.is_empty(), "{output:?}");
+    }
+
+    #[test]
+    fn check_digest_file_ok_line_fully_delivered_through_interruptions() {
+        let dir = TestDir::new("retry-check-file-ok");
+        let path = dir.write_file(OsStr::new("hello.txt"), b"abc");
+        let digest_path =
+            dir.write_file(OsStr::new("hello.sha256"), format!("{ABC_HEX}\n").as_bytes());
+
+        // 摘要文件本身的读取与“OK\n”的写出都经历中断与短写。
+        let output = run_with_shim(
+            "i,s1,i,s1,i,s1,i",
+            &[
+                OsStr::new("check-digest-file"),
+                path.as_os_str(),
+                digest_path.as_os_str(),
             ],
         );
 
