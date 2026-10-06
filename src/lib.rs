@@ -982,6 +982,51 @@ mod tests {
         der
     }
 
+    /// 与 [`spki_der`] 相同的 SPKI 结构，但不假设各部分长度都能用短形式
+    /// 单字节表示：算法 OID 内容或位串长度变大（例如某个弧按 base-128
+    /// 占多个编码字节）时，算法序列与外层序列的长度改用 DER 长形式。
+    /// 其余结构约定不变：算法参数缺省，位串未使用位数为零。
+    fn spki_der_with(oid_content: &[u8], key: &[u8]) -> Vec<u8> {
+        let oid = der_tlv(0x06, oid_content);
+        let algorithm = der_tlv(0x30, &oid);
+        // 位串内容 = 1 字节未使用位数 + 公钥。
+        let mut bit_string_content = Vec::with_capacity(1 + key.len());
+        bit_string_content.push(0x00);
+        bit_string_content.extend_from_slice(key);
+        let bit_string = der_tlv(0x03, &bit_string_content);
+
+        let mut spki_content = Vec::new();
+        spki_content.extend_from_slice(&algorithm);
+        spki_content.extend_from_slice(&bit_string);
+        der_tlv(0x30, &spki_content)
+    }
+
+    /// 规范的 DER 定长编码：短于 128 用短形式，否则用最短的长形式。
+    fn der_len(len: usize) -> Vec<u8> {
+        if len < 0x80 {
+            vec![len as u8]
+        } else {
+            let mut bytes = Vec::new();
+            let mut rest = len;
+            while rest > 0 {
+                bytes.push((rest & 0xff) as u8);
+                rest >>= 8;
+            }
+            bytes.reverse();
+            let mut out = vec![0x80 | bytes.len() as u8];
+            out.extend_from_slice(&bytes);
+            out
+        }
+    }
+
+    /// 拼接一个通用单字节标签的 TLV。
+    fn der_tlv(tag: u8, content: &[u8]) -> Vec<u8> {
+        let mut out = vec![tag];
+        out.extend_from_slice(&der_len(content.len()));
+        out.extend_from_slice(content);
+        out
+    }
+
     #[test]
     fn imports_rfc8410_example_and_exposes_raw_bytes_and_hex() {
         let key = Ed25519PublicKey::from_spki_der(RFC8410_SPKI).unwrap();
@@ -1038,6 +1083,143 @@ mod tests {
             other => panic!("expected UnsupportedAlgorithm, got {other:?}"),
         }
         assert!(err.to_string().contains("1.3.101.110"));
+    }
+
+    #[test]
+    fn multibyte_arc_above_127_is_one_arc_and_reports_unsupported() {
+        // 1.3.128.112：第三段 128 按 base-128 必须占两个字节（81 00）。
+        // 这是一份完整、规范的 SPKI（算法参数缺省、未使用位数为零、
+        // 公钥恰好 32 字节），只是算法不是 Ed25519。
+        let oid_content: &[u8] = &[0x2b, 0x81, 0x00, 0x70];
+        let key = [0x42u8; 32];
+        let der = spki_der_with(oid_content, &key);
+        let err = Ed25519PublicKey::from_spki_der(&der).unwrap_err();
+
+        // 结构合法 → 必须是“算法不支持”，不能报格式错误，也不能导入成功。
+        match &err {
+            ImportPublicKeyError::UnsupportedAlgorithm(oid) => {
+                // 多字节的一段必须还原成单个数值 128，不能拆成 1 和 0，
+                // 次序与段数也保持不变。
+                assert_eq!(oid.arcs(), &[1, 3, 128, 112]);
+                assert_eq!(oid.to_string(), "1.3.128.112");
+            }
+            other => panic!("expected UnsupportedAlgorithm, got {other:?}"),
+        }
+        // 错误展示中仍是原来的点分十进制标识，不依赖整句措辞。
+        assert!(err.to_string().contains("1.3.128.112"));
+    }
+
+    #[test]
+    fn larger_multibyte_arcs_preserve_every_arc_value_and_order() {
+        let key = [0x55u8; 32];
+        // （OID 内容字节, 期望的各段弧）：覆盖占两个与三个 base-128
+        // 字节的弧，且它们出现在不同位置。
+        let cases: &[(&[u8], &[u64], &str)] = &[
+            // 1.3.101.256.4：256 = 82 00。
+            (
+                &[0x2b, 0x65, 0x82, 0x00, 0x04],
+                &[1, 3, 101, 256, 4],
+                "1.3.101.256.4",
+            ),
+            // 1.3.8000.110：8000 = be 40。
+            (&[0x2b, 0xbe, 0x40, 0x6e], &[1, 3, 8000, 110], "1.3.8000.110"),
+            // 1.3.101.16384：末段 16384 占三个字节（81 80 00）。
+            (
+                &[0x2b, 0x65, 0x81, 0x80, 0x00],
+                &[1, 3, 101, 16384],
+                "1.3.101.16384",
+            ),
+        ];
+
+        for (oid_content, expected_arcs, expected_text) in cases {
+            let der = spki_der_with(oid_content, &key);
+            let err = Ed25519PublicKey::from_spki_der(&der).unwrap_err();
+            match &err {
+                ImportPublicKeyError::UnsupportedAlgorithm(oid) => {
+                    assert_eq!(oid.arcs(), *expected_arcs, "oid content {oid_content:02x?}");
+                    assert_eq!(oid.to_string(), *expected_text);
+                    assert!(err.to_string().contains(expected_text));
+                }
+                other => panic!("expected UnsupportedAlgorithm for {expected_text}, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn first_two_arcs_combined_in_a_multibyte_subidentifier_are_preserved() {
+        let key = [0x66u8; 32];
+
+        // 前两段弧合并在第一个子标识符里：200 = 81 48 → 2.120，
+        // 后续 101、112 各占一字节：2.120.101.112。
+        let der = spki_der_with(&[0x81, 0x48, 0x65, 0x70], &key);
+        let err = Ed25519PublicKey::from_spki_der(&der).unwrap_err();
+        match &err {
+            ImportPublicKeyError::UnsupportedAlgorithm(oid) => {
+                assert_eq!(oid.arcs(), &[2, 120, 101, 112]);
+                assert_eq!(oid.to_string(), "2.120.101.112");
+            }
+            other => panic!("expected UnsupportedAlgorithm, got {other:?}"),
+        }
+        assert!(err.to_string().contains("2.120.101.112"));
+
+        // 只有两段弧、且合并编码本身占两个字节：16383 = ff 7f → 2.16303。
+        // 不能只保留前面的分段，也不能凭空补段。
+        let der = spki_der_with(&[0xff, 0x7f], &key);
+        let err = Ed25519PublicKey::from_spki_der(&der).unwrap_err();
+        match &err {
+            ImportPublicKeyError::UnsupportedAlgorithm(oid) => {
+                assert_eq!(oid.arcs(), &[2, 16303]);
+                assert_eq!(oid.to_string(), "2.16303");
+            }
+            other => panic!("expected UnsupportedAlgorithm, got {other:?}"),
+        }
+        assert!(err.to_string().contains("2.16303"));
+    }
+
+    #[test]
+    fn malformed_multibyte_oid_encodings_are_malformed_not_unsupported() {
+        let key = [0x77u8; 32];
+        // 这些 SPKI 的外层结构都完整，只有算法 OID 内容本身损坏：
+        // 一律 Malformed——不能先报算法不支持，也不能裁剪/补齐后再用。
+        let cases: &[&[u8]] = &[
+            &[],                                  // 算法标识为空
+            &[0x2b, 0x65, 0x81],                  // 末段子标识符续位未结束
+            &[0x81],                              // 第一个子标识符就未结束
+            &[0x2b, 0x65, 0x80, 0x6e],            // 单字节值带冗余前导 0x80
+            &[0x2b, 0x65, 0x80, 0x81, 0x00],      // 多字节值带冗余前导 0x80
+            &[0x80, 0x48],                        // 首段即非规范前导零
+        ];
+        for oid_content in cases {
+            let der = spki_der_with(oid_content, &key);
+            assert_eq!(
+                Ed25519PublicKey::from_spki_der(&der).unwrap_err(),
+                ImportPublicKeyError::Malformed,
+                "oid content {oid_content:02x?} must be Malformed"
+            );
+        }
+
+        // 整体编码被截断（OID 的多字节段连同后续结构缺失）同样是 Malformed：
+        // 取一份合法的多字节弧 SPKI，砍掉末尾若干字节。
+        let good = spki_der_with(&[0x2b, 0x81, 0x00, 0x70], &key);
+        assert_eq!(
+            Ed25519PublicKey::from_spki_der(&good[..good.len() - 1]).unwrap_err(),
+            ImportPublicKeyError::Malformed
+        );
+    }
+
+    #[test]
+    fn canonical_ed25519_input_still_imports_alongside_multibyte_regressions() {
+        // 通用构造器在短长度情形下必须逐字节等价于 RFC 8410 的规范编码。
+        let key_bytes: [u8; 32] = RFC8410_SPKI[12..].try_into().unwrap();
+        let built = spki_der_with(&[0x2b, 0x65, 0x70], &key_bytes);
+        assert_eq!(built, RFC8410_SPKI);
+
+        // 两条路径都成功导入，且得到相同的 32 字节公钥。
+        let from_rfc = Ed25519PublicKey::from_spki_der(RFC8410_SPKI).unwrap();
+        let from_built = Ed25519PublicKey::from_spki_der(&built).unwrap();
+        assert_eq!(from_rfc, from_built);
+        assert_eq!(from_built.as_bytes(), &RFC8410_SPKI[12..]);
+        assert_eq!(from_built.to_hex(), RFC8410_KEY_HEX);
     }
 
     #[test]
