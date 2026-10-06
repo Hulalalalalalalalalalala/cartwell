@@ -59,40 +59,110 @@ fn main() -> ExitCode {
 
 /// 打开 `path` 并以流式方式读取其全部内容，返回完整摘要。
 ///
-/// 这是 `digest` 与 `check-digest` 共用的唯一文件访问规则：始终以操作
-/// 系统给出的原始路径打开文件（用于显示的文字绝不参与访问），以原始
-/// 字节流式计算摘要——空文件、二进制内容与各种换行形式都按同一条规则
-/// 处理，内存占用与文件大小无关。文件打不开与读取中途失败是两类不同的
-/// 失败（见 [`FileAccessError`]）；即使已读入一部分内容，读取失败也绝不
-/// 返回部分摘要。
+/// 这是计算与核对内容文件时共用的唯一文件访问规则：始终以操作系统给出
+/// 的原始路径打开文件（用于显示的文字绝不参与访问），以原始字节流式
+/// 计算摘要——空文件、二进制内容与各种换行形式都按同一条规则处理，内存
+/// 占用与文件大小无关。文件打不开与读取中途失败是两类不同的失败（见
+/// [`FileAccessError`] 的 [`AccessPhase`]）；即使已读入一部分内容，读取
+/// 失败也绝不返回部分摘要。
 fn digest_file(path: &Path) -> Result<Sha256Digest, FileAccessError> {
     let file = File::open(path)
-        .map_err(|err| FileAccessError::Open(path.to_path_buf(), err))?;
+        .map_err(|err| FileAccessError::open(FileRole::Content, path, err))?;
     inkseal::digest_reader(file)
-        .map_err(|err| FileAccessError::Read(path.to_path_buf(), err))
+        .map_err(|err| FileAccessError::read(FileRole::Content, path, ReadError::Stream(err)))
 }
 
-/// 读取单个文件计算完整摘要时的失败，区分“打不开”与“读取中途失败”,
-/// 以便两条命令共用同一套提示规则。
-enum FileAccessError {
-    /// 文件无法打开；携带原始路径与系统给出的原因。
-    Open(PathBuf, io::Error),
-    /// 文件已打开但读取中途失败；已读入的部分内容不产生任何摘要。
-    Read(PathBuf, inkseal::DigestError),
+/// 被访问的文件类别：决定访问失败时如何称呼出错对象，只影响提示显示，
+/// 绝不影响始终以真实路径发起的文件访问。
+enum FileRole {
+    /// 待核对的内容文件（三条命令里作为核对对象的那个文件）。
+    Content,
+    /// `check-digest-file` 读取的摘要文件。
+    DigestFile,
+}
+
+/// 文件访问失败发生的阶段：同类失败在内容文件与摘要文件之间共用同一
+/// 分类——“打不开”区别于“已打开但读取中途失败”，底层原因原样保留。
+enum AccessPhase {
+    /// 文件无法打开（不存在、权限不足等），携带系统给出的原因。
+    Open(io::Error),
+    /// 文件已打开但读取中途失败（含路径指向目录时的读取错误），携带
+    /// 读取来源给出的原因；已读入的部分内容不产生任何摘要。
+    Read(ReadError),
+}
+
+/// “读取中途失败”的底层原因，按读取来源区分其呈现：两者都保留系统给出
+/// 的具体原因，读取原因不能被简化或抹平成“打不开”。
+enum ReadError {
+    /// 内容文件经库的流式读取失败（[`inkseal::digest_reader`]），提示
+    /// 保留其 `failed to read input: ` 前缀与系统原因。
+    Stream(inkseal::DigestError),
+    /// 摘要文件经普通读取失败，直接呈现系统的 [`io::Error`]。
+    Plain(io::Error),
+}
+
+impl ReadError {
+    /// 底层原因的可显示引用：流式读取保留其自身前缀与系统原因，普通读取
+    /// 直接是系统原因。两种来源都不会被改写成“打不开”。
+    fn cause(&self) -> &dyn std::fmt::Display {
+        match self {
+            ReadError::Stream(err) => err,
+            ReadError::Plain(err) => err,
+        }
+    }
+}
+
+/// 任一输入文件访问失败的统一表示：哪个文件（[`FileRole`] 与真实路径）、
+/// 打不开还是读不了（[`AccessPhase`]）以及底层原因。内容文件与摘要文件
+/// 因此遵循同一套分类与提示规则，同时保留“哪个文件出了什么问题”的区别。
+struct FileAccessError {
+    /// 出错对象是内容文件还是摘要文件。
+    role: FileRole,
+    /// 操作系统给出的真实路径，只用于访问；提示显示另走 [`path_display`]。
+    path: PathBuf,
+    /// 失败阶段与底层原因。
+    phase: AccessPhase,
 }
 
 impl FileAccessError {
-    /// 渲染为既有的单行错误提示（含末尾换行）：仅在此时把路径做损失性
-    /// 转换并转义控制字符，显示文字不影响也不回溯到实际访问对象。
-    fn message(&self) -> String {
-        match self {
-            FileAccessError::Open(path, err) => {
-                format!("inkseal: cannot open '{}': {err}\n", path_display(path))
-            }
-            FileAccessError::Read(path, err) => {
-                format!("inkseal: cannot read '{}': {err}\n", path_display(path))
-            }
+    /// 构造一次“打不开”失败，保留原始路径与系统给出的原因。
+    fn open(role: FileRole, path: &Path, err: io::Error) -> Self {
+        FileAccessError {
+            role,
+            path: path.to_path_buf(),
+            phase: AccessPhase::Open(err),
         }
+    }
+
+    /// 构造一次“读取中途失败”，保留原始路径与底层原因。
+    fn read(role: FileRole, path: &Path, cause: ReadError) -> Self {
+        FileAccessError {
+            role,
+            path: path.to_path_buf(),
+            phase: AccessPhase::Read(cause),
+        }
+    }
+
+    /// 渲染为既有的单行错误提示（含末尾换行）。
+    ///
+    /// 仅在此时把路径做损失性转换并转义控制字符（见 [`path_display`]）：
+    /// 显示文字不影响也不回溯到实际访问对象，两个真实路径即使显示相同
+    /// 也不会互相替代。对象称呼（内容文件不加词、摘要文件标注
+    /// `digest file`）、动词（`open` / `read`）与底层原因共同保证用户能
+    /// 辨认“哪个文件出了什么问题”，且现有提示文字与行结构保持不变。
+    fn message(&self) -> String {
+        let object = match self.role {
+            FileRole::Content => "",
+            FileRole::DigestFile => "digest file ",
+        };
+        let (verb, cause): (&str, &dyn std::fmt::Display) = match &self.phase {
+            AccessPhase::Open(err) => ("open", err),
+            AccessPhase::Read(read) => ("read", read.cause()),
+        };
+        format!(
+            "inkseal: cannot {verb} {object}'{}': {cause}\n",
+            path_display(&self.path)
+        )
     }
 }
 
@@ -298,15 +368,16 @@ fn finish_digest_check(path: &Path, expected: Sha256Digest) -> ExitCode {
 
 /// 读取并解析摘要文件时的失败。
 ///
-/// 前两类是摘要文件本身的访问问题（以 `1` 退出）；[`Malformed`](Self::Malformed)
-/// 是内容不符合“恰好一份摘要”的格式约定（以 `2` 退出）。三类都必须在
-/// 待核对文件被访问之前判定，且提示里都要带上摘要文件自己的路径，绝不
-/// 能把摘要文件的问题改报成待核对文件的访问错误。
+/// [`Access`](Self::Access) 是摘要文件本身的访问问题（打不开或读取中途
+/// 失败，以 `1` 退出），直接复用三条命令共用的 [`FileAccessError`]——它
+/// 已带 [`FileRole::DigestFile`]，因此提示会明确对象是摘要文件，又与内容
+/// 文件遵循同一条打开/读取分类规则。[`Malformed`](Self::Malformed) 是内容
+/// 不符合“恰好一份摘要”的格式约定（以 `2` 退出）。两类都必须在待核对
+/// 文件被访问之前判定，且提示里都要带上摘要文件自己的路径，绝不能把摘要
+/// 文件的问题改报成待核对文件的访问错误。
 enum DigestFileError {
-    /// 摘要文件无法打开（不存在、权限不足等）。
-    Open(PathBuf, io::Error),
-    /// 摘要文件已打开但读取中途失败（含路径指向目录时的读取错误）。
-    Read(PathBuf, io::Error),
+    /// 摘要文件无法打开或读取中途失败（含路径指向目录时的读取错误）。
+    Access(FileAccessError),
     /// 摘要文件内容不符合格式约定。
     Malformed(PathBuf, DigestFileProblem),
 }
@@ -361,13 +432,20 @@ impl DigestFileProblem {
 fn load_expected_digest_file(path: &Path) -> Result<Sha256Digest, DigestFileError> {
     use std::io::Read as _;
 
-    let file = File::open(path)
-        .map_err(|err| DigestFileError::Open(path.to_path_buf(), err))?;
+    let file = File::open(path).map_err(|err| {
+        DigestFileError::Access(FileAccessError::open(FileRole::DigestFile, path, err))
+    })?;
 
     let mut content = Vec::with_capacity(67);
     file.take(67)
         .read_to_end(&mut content)
-        .map_err(|err| DigestFileError::Read(path.to_path_buf(), err))?;
+        .map_err(|err| {
+            DigestFileError::Access(FileAccessError::read(
+                FileRole::DigestFile,
+                path,
+                ReadError::Plain(err),
+            ))
+        })?;
 
     parse_digest_file_content(&content)
         .map_err(|problem| DigestFileError::Malformed(path.to_path_buf(), problem))
@@ -409,25 +487,10 @@ fn run_check_digest_file(path: &Path, digest_path: &Path) -> ExitCode {
     // 绝不访问待核对文件——即使待核对文件不存在，也不得改报它的错误。
     let expected = match load_expected_digest_file(digest_path) {
         Ok(digest) => digest,
-        Err(DigestFileError::Open(p, err)) => {
-            return emit_error(
-                1,
-                format!(
-                    "inkseal: cannot open digest file '{}': {err}\n",
-                    path_display(&p)
-                )
-                .as_bytes(),
-            );
-        }
-        Err(DigestFileError::Read(p, err)) => {
-            return emit_error(
-                1,
-                format!(
-                    "inkseal: cannot read digest file '{}': {err}\n",
-                    path_display(&p)
-                )
-                .as_bytes(),
-            );
+        // 打不开与读取中途失败共用内容文件那一条提示规则，只是对象被
+        // 明确标注为摘要文件；两者都以退出码 1 结束，不进入内容比较。
+        Err(DigestFileError::Access(err)) => {
+            return emit_error(1, err.message().as_bytes());
         }
         Err(DigestFileError::Malformed(p, problem)) => {
             return emit_error(
