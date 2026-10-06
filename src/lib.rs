@@ -211,9 +211,19 @@ impl Ed25519PublicKey {
     /// 所在位串的未使用位数为零，公钥内容恰好 32 字节。截断数据、声明
     /// 长度与实际内容不符、非规范长度编码、容器中出现多余字段或对象
     /// 之后还有字节都返回 [`ImportPublicKeyError::Malformed`]，不忽略
-    /// 剩余内容，也不自动补齐。整体编码合法但算法标识不是 Ed25519 时
-    /// 返回 [`ImportPublicKeyError::UnsupportedAlgorithm`]，并保留实际
-    /// 标识供调用方展示。
+    /// 剩余内容，也不自动补齐。
+    ///
+    /// “公钥恰好 32 字节”只是 Ed25519 这一种算法的长度要求，不是容器
+    /// 本身的格式要求：一份完整、规范、参数缺省且位串未使用位数为零的
+    /// SubjectPublicKeyInfo，即便公钥内容长度对 Ed25519 不对（例如算法
+    /// 标识为 Ed448 `1.3.101.113`、公钥内容 57 字节），仍属于“容器有效
+    /// 但算法不符”，返回 [`ImportPublicKeyError::UnsupportedAlgorithm`]
+    /// 并保留实际标识——调用方据此知道应当改用所需算法的公钥，而不是去
+    /// 修复编码；这种输入绝不会产出可继续使用的 Ed25519 公钥，也不会把
+    /// 公钥内容截短为 32 字节后接受。只有当整体编码合法时才判断算法：
+    /// 编码已损坏（截断、长度不符、对象后多余字节、非规范长度编码、参数
+    /// 写成 NULL、位串未使用位数非零等）时，即使局部能看到别的算法标识，
+    /// 也一律返回 [`ImportPublicKeyError::Malformed`]。
     ///
     /// 导入成功只表示编码被接受：不表示已验证任何文件签名，也不表示
     /// 确认了公钥持有者的身份。
@@ -241,16 +251,27 @@ impl Ed25519PublicKey {
             return Err(MALFORMED);
         }
         let algorithm_oid = decode_oid(oid_content).ok_or(MALFORMED)?;
-        // 位串：未使用位数为零，公钥内容恰好 32 字节。
+        // 位串的结构要求与算法无关：承载公钥的位串未使用位数必须为零。
+        // 注意此时**不**校验公钥内容长度——57 字节的 Ed448 公钥
+        // （1.3.101.113）容器同样是完整、规范的 DER，只是算法不是
+        // Ed25519；长度要求（32 字节）是 Ed25519 这一种算法的要求，
+        // 必须在确认算法后再施加，不能把“选错算法”误报成“编码损坏”。
         let (&unused_bits, key) = bit_string.split_first().ok_or(MALFORMED)?;
-        if unused_bits != 0 || key.len() != 32 {
+        if unused_bits != 0 {
             return Err(MALFORMED);
         }
 
-        // 只有整体结构完整、DER 合法时才判断算法：编码已损坏的输入
-        // 一律报格式错误，不因局部看到其他算法标识而改报算法不支持。
+        // 只有整体结构完整、DER 合法（含位串未使用位数为零）时才判断
+        // 算法：编码已损坏的输入一律报格式错误，不因局部看到其他算法
+        // 标识而改报算法不支持。
         if algorithm_oid.arcs() != [1, 3, 101, 112] {
             return Err(ImportPublicKeyError::UnsupportedAlgorithm(algorithm_oid));
+        }
+
+        // 已确认是 Ed25519：公钥内容恰好 32 字节。多了（例如容器里是
+        // 57 字节的 Ed448 公钥）或少了都不能接受，也绝不截短后接受。
+        if key.len() != 32 {
+            return Err(MALFORMED);
         }
 
         let mut bytes = [0u8; 32];
@@ -323,11 +344,18 @@ impl fmt::Display for ObjectIdentifier {
 pub enum ImportPublicKeyError {
     /// 输入不是一份完整、规范的 DER 编码 SubjectPublicKeyInfo：截断、
     /// 声明长度与实际内容不符、非规范长度编码、算法参数未缺省（含写成
-    /// NULL）、位串未使用位数非零、公钥长度不是 32 字节、容器中出现
-    /// 多余字段或对象之后还有字节等。
+    /// NULL）、位串未使用位数非零、容器中出现多余字段或对象之后还有
+    /// 字节等；也包括算法标识确实是 Ed25519（`1.3.101.112`）但公钥
+    /// 长度不是 32 字节的情形。注意：结构完整、DER 合法但算法是别的
+    /// 标识时（例如公钥 57 字节的 Ed448 `1.3.101.113`），公钥长度对
+    /// 本入口不对并不属于编码损坏，而归入
+    /// [`UnsupportedAlgorithm`](Self::UnsupportedAlgorithm)。
     Malformed,
-    /// 整体编码合法，但算法标识不是 Ed25519（`1.3.101.112`）；携带实际
-    /// 标识供调用方展示。
+    /// 整体编码合法（结构完整、DER 规范、参数缺省、位串未使用位数为
+    /// 零），但算法标识不是 Ed25519（`1.3.101.112`）；携带实际标识供
+    /// 调用方展示。例如一份规范的 Ed448 公钥（`1.3.101.113`，公钥
+    /// 57 字节）会落到这里：它的编码没有问题，调用方需要换成所需算法
+    /// 的公钥，而不是修复编码。本入口仍拒绝它，不产出公钥对象。
     UnsupportedAlgorithm(ObjectIdentifier),
 }
 
@@ -974,13 +1002,26 @@ mod tests {
 
     /// 由算法 OID 内容字节与 32 字节公钥拼装一份规范编码的 SPKI。
     fn spki_der(oid_content: &[u8], key: &[u8; 32]) -> Vec<u8> {
+        spki_der_key(oid_content, key)
+    }
+
+    /// 由算法 OID 内容字节与任意长度公钥拼装一份规范编码的 SPKI。
+    ///
+    /// 用于构造非 Ed25519 算法（例如公钥 57 字节的 Ed448）的完整容器：
+    /// 参数缺省、位串未使用位数为零。这里出现的长度都远小于 128，短形式
+    /// 长度编码本身就是 DER 规范编码。
+    fn spki_der_key(oid_content: &[u8], key: &[u8]) -> Vec<u8> {
         // 外层内容 = 算法序列（2 字节头 + 2 字节 OID 头 + OID 内容）
-        //          + 位串（2 字节头 + 1 字节未使用位数 + 32 字节公钥）。
-        let outer_len = oid_content.len() + 4 + 35;
-        let mut der = vec![0x30, outer_len as u8, 0x30, (oid_content.len() + 2) as u8, 0x06];
+        //          + 位串（2 字节头 + 1 字节未使用位数 + 公钥内容）。
+        let alg_len = oid_content.len() + 2;
+        let bit_string_len = key.len() + 1;
+        let outer_len = alg_len + 2 + bit_string_len + 2;
+        let mut der = vec![0x30, outer_len as u8, 0x30, alg_len as u8, 0x06];
         der.push(oid_content.len() as u8);
         der.extend_from_slice(oid_content);
-        der.extend_from_slice(&[0x03, 0x21, 0x00]);
+        der.push(0x03);
+        der.push(bit_string_len as u8);
+        der.push(0x00);
         der.extend_from_slice(key);
         der
     }
@@ -1041,6 +1082,151 @@ mod tests {
             other => panic!("expected UnsupportedAlgorithm, got {other:?}"),
         }
         assert!(err.to_string().contains("1.3.101.110"));
+    }
+
+    /// Ed448（1.3.101.113）算法 OID 内容字节；末段 113 编码为 0x71。
+    const ED448_OID: &[u8] = &[0x2b, 0x65, 0x71];
+    /// Ed448 公钥长度：RFC 8032 的 Ed448 公钥恰好 57 字节。
+    const ED448_KEY_LEN: usize = 57;
+
+    /// 一份完整、规范的 Ed448 SubjectPublicKeyInfo（参数缺省、未使用位数
+    /// 为零、公钥 57 字节、对象之后无多余字节）。
+    fn valid_ed448_spki() -> Vec<u8> {
+        spki_der_key(ED448_OID, &vec![0x44u8; ED448_KEY_LEN])
+    }
+
+    #[test]
+    fn well_formed_ed448_spki_reports_unsupported_algorithm_not_malformed() {
+        let der = valid_ed448_spki();
+
+        // 结构完整、DER 规范，只是算法不是 Ed25519：必须报算法不支持，
+        // 携带实际标识 1.3.101.113，不能因为公钥是 57 字节就当成格式损坏。
+        let err = Ed25519PublicKey::from_spki_der(&der).unwrap_err();
+        match &err {
+            ImportPublicKeyError::UnsupportedAlgorithm(oid) => {
+                assert_eq!(oid.arcs(), &[1, 3, 101, 113]);
+                assert_eq!(oid.to_string(), "1.3.101.113");
+            }
+            other => panic!("expected UnsupportedAlgorithm(1.3.101.113), got {other:?}"),
+        }
+        // 错误文字显示实际标识，并说明本入口需要 Ed25519。
+        let msg = err.to_string();
+        assert!(msg.contains("1.3.101.113"), "message must name Ed448 OID: {msg}");
+        assert!(msg.contains("1.3.101.112"), "message must name Ed25519 OID: {msg}");
+        assert!(
+            msg.to_lowercase().contains("ed25519"),
+            "message must state Ed25519 is required: {msg}"
+        );
+        // 与 X25519 的算法不支持结果同属一类，但携带的 OID 不同。
+        let x25519 = spki_der(&[0x2b, 0x65, 0x6e], &[0x42; 32]);
+        let xerr = Ed25519PublicKey::from_spki_der(&x25519).unwrap_err();
+        assert!(matches!(xerr, ImportPublicKeyError::UnsupportedAlgorithm(_)));
+        assert_ne!(err, xerr);
+    }
+
+    #[test]
+    fn ed448_key_is_never_imported_or_truncated_to_32_bytes() {
+        // 无论 57 字节内容是什么，都不会得到可继续使用的 Ed25519 公钥。
+        let der = valid_ed448_spki();
+        assert!(Ed25519PublicKey::from_spki_der(&der).is_err());
+
+        // 即使公钥前 32 字节恰好等于某个合法 Ed25519 公钥，也不能把
+        // 57 字节截短成 32 字节后接受。
+        let mut key = vec![0u8; ED448_KEY_LEN];
+        key[..32].copy_from_slice(&RFC8410_SPKI[12..]);
+        let der = spki_der_key(ED448_OID, &key);
+        assert_eq!(
+            Ed25519PublicKey::from_spki_der(&der).unwrap_err(),
+            ImportPublicKeyError::UnsupportedAlgorithm(
+                decode_oid(ED448_OID).expect("ed448 oid decodes")
+            )
+        );
+    }
+
+    #[test]
+    fn corrupted_ed448_containers_are_malformed_even_though_algorithm_is_known() {
+        // 基准：完整的 Ed448 容器是算法不支持，下面的每个变体都必须是
+        // 格式错误，不能因为识别出 Ed448 标识就掩盖编码损坏。
+
+        // 截断：外层声明的内容不完整。
+        let full = valid_ed448_spki();
+        assert_eq!(
+            Ed25519PublicKey::from_spki_der(&full[..full.len() - 5]).unwrap_err(),
+            ImportPublicKeyError::Malformed
+        );
+
+        // 声明长度超过实际内容（外层）。
+        let mut der = full.clone();
+        der[1] += 3;
+        assert_eq!(
+            Ed25519PublicKey::from_spki_der(&der).unwrap_err(),
+            ImportPublicKeyError::Malformed
+        );
+
+        // 位串声明长度与公钥内容不符（声明更长，内容不够）。
+        let mut der = full.clone();
+        der[10] += 2;
+        assert_eq!(
+            Ed25519PublicKey::from_spki_der(&der).unwrap_err(),
+            ImportPublicKeyError::Malformed
+        );
+
+        // 完整对象之后还有多余字节。
+        let mut trailing = full.clone();
+        trailing.push(0x00);
+        assert_eq!(
+            Ed25519PublicKey::from_spki_der(&trailing).unwrap_err(),
+            ImportPublicKeyError::Malformed
+        );
+
+        // 非规范长度编码：本可用短形式的外层长度（69）却用了长形式。
+        let mut noncanon = vec![0x30, 0x81, full[1]];
+        noncanon.extend_from_slice(&full[2..]);
+        assert_eq!(
+            Ed25519PublicKey::from_spki_der(&noncanon).unwrap_err(),
+            ImportPublicKeyError::Malformed
+        );
+
+        // 算法参数写成 NULL（05 00）而不是缺省。
+        // 算法序列内容由 5 字节（仅 OID TLV）变为 7 字节（多了 NULL
+        // TLV），外层内容由 67 变为 69，位串头从偏移 9 移到 11。
+        let mut with_null = vec![
+            0x30, 0x45, 0x30, 0x07, 0x06, 0x03, 0x2b, 0x65, 0x71, 0x05, 0x00, 0x03,
+            (ED448_KEY_LEN + 1) as u8, 0x00,
+        ];
+        with_null.extend(std::iter::repeat(0x44u8).take(ED448_KEY_LEN));
+        assert_eq!(
+            Ed25519PublicKey::from_spki_der(&with_null).unwrap_err(),
+            ImportPublicKeyError::Malformed
+        );
+
+        // 位串未使用位数非零。
+        let mut bad_bits = full.clone();
+        bad_bits[11] = 0x07;
+        assert_eq!(
+            Ed25519PublicKey::from_spki_der(&bad_bits).unwrap_err(),
+            ImportPublicKeyError::Malformed
+        );
+    }
+
+    #[test]
+    fn ed448_bit_string_with_declared_ed25519_sized_key_still_checks_algorithm_first() {
+        // 同一 57 字节位串、但结构完整时按算法归类：Ed448 标识 → 算法不支持。
+        // 对照：把 OID 改成 Ed25519 但位串仍是 57 字节 → 公钥长度不对，
+        // 此时算法确实是 Ed25519，属于格式错误。
+        let ed448 = valid_ed448_spki();
+        assert!(matches!(
+            Ed25519PublicKey::from_spki_der(&ed448).unwrap_err(),
+            ImportPublicKeyError::UnsupportedAlgorithm(_)
+        ));
+
+        let mut ed25519_oid_wrong_size = ed448.clone();
+        // OID 末段在索引 8：0x71（113）→ 0x70（112），长度结构不变。
+        ed25519_oid_wrong_size[8] = 0x70;
+        assert_eq!(
+            Ed25519PublicKey::from_spki_der(&ed25519_oid_wrong_size).unwrap_err(),
+            ImportPublicKeyError::Malformed
+        );
     }
 
     #[test]
