@@ -1,7 +1,8 @@
 # inkseal
 
 当前版本提供命令行版本查询、单文件 SHA-256 摘要计算，以及用已保存的
-摘要核对文件内容。
+摘要核对文件内容。Rust 库除同一内容规则的摘要计算外，还提供 DER 编码
+Ed25519 公钥的导入（见“Rust 库接口”一节）。
 
 ## 构建与运行
 
@@ -237,3 +238,58 @@ assert_eq!(restored, computed);
 
 该错误实现了 `Display` 和 `std::error::Error`，可直接显示或装入
 `Box<dyn Error>` 传递。
+
+### 导入 Ed25519 公钥
+
+`Ed25519PublicKey::from_spki_der` 从 **二进制**的 DER 编码
+SubjectPublicKeyInfo（RFC 8410）导入 Ed25519 公钥：
+
+```rust
+use inkseal::Ed25519PublicKey;
+
+// 传入的是二进制公钥容器：一份完整的 DER 编码 SubjectPublicKeyInfo，
+// 不是 PEM 文本、不是十六进制文本，也不是 32 字节的裸公钥。
+let der: &[u8] = &[
+    0x30, 0x2a, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x03, 0x21, 0x00,
+    0xd7, 0x5a, 0x98, 0x01, 0x82, 0xb1, 0x0a, 0xb7, 0xd5, 0x4b, 0xfe, 0xd3,
+    0xc9, 0x64, 0x07, 0x3a, 0x0e, 0xe1, 0x72, 0xf3, 0xda, 0xa6, 0x23, 0x25,
+    0xaf, 0x02, 0x1a, 0x68, 0xf7, 0x07, 0x51, 0x1a,
+];
+let key = Ed25519PublicKey::from_spki_der(der).unwrap();
+assert_eq!(key.as_bytes(), &der[12..]); // 原始 32 字节公钥
+assert_eq!(
+    key.to_hex(),
+    "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a"
+);
+```
+
+**导入成功只表示编码被接受**：不表示已验证任何文件签名，也不表示
+确认了公钥持有者的身份。
+
+`Ed25519PublicKey` 与 `Sha256Digest` 是两个明确区分的类型，不能把
+公钥当作摘要解析。公钥的文本表示固定为 64 个小写十六进制字符
+（`to_hex()` 或 `Display`，保留前导零，不含标签或换行），它表示
+公钥本身的 32 字节，**不是**公钥的 SHA-256 摘要。两个公钥可用
+`==` 按值比较是否相同。
+
+接受范围遵循 RFC 8410：算法标识为 `1.3.101.112`，算法参数必须缺省
+（即使写成 NULL 也拒绝），公钥所在位串的未使用位数为零，公钥内容
+恰好 32 字节。输入必须是一份完整、规范的 DER 对象——截断数据、
+声明长度与实际内容不符、非规范长度编码、容器中出现多余字段或对象
+之后还有字节都会被拒绝，不会忽略剩余内容或自动补齐。裸公钥、
+十六进制文本和 PEM 文本不属于这个入口接受的格式，不做格式猜测或
+文本转换。
+
+导入失败返回公开的类型化错误 `ImportPublicKeyError`，调用方按变体
+即可区分两类失败，无需分析提示字符串：
+
+- `ImportPublicKeyError::Malformed`：编码或公钥结构不合法（包括
+  参数写成 NULL、位串未使用位数非零、公钥长度不对、有多余字节等）。
+- `ImportPublicKeyError::UnsupportedAlgorithm(oid)`：结构完整、
+  DER 合法，但算法标识不是 Ed25519；`oid` 保留实际标识（可显示为
+  点分形式，如 `1.3.101.110`）供调用方展示。整体编码已损坏的输入
+  一律返回 `Malformed`，不会因为局部看到其他算法标识而改报算法
+  不支持。
+
+任何失败都不会产出可继续使用的公钥对象。该错误实现了 `Display`
+和 `std::error::Error`。

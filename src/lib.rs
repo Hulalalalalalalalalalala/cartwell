@@ -1,6 +1,8 @@
-//! inkseal 的库接口：对任意实现 [`std::io::Read`] 的输入计算 SHA-256 摘要。
+//! inkseal 的库接口：对任意实现 [`std::io::Read`] 的输入计算 SHA-256 摘要，
+//! 以及导入 DER 编码（SubjectPublicKeyInfo）的 Ed25519 公钥。
 //!
 //! 摘要只取决于输入的原始字节，与命令行 `inkseal digest <文件>` 遵循同一内容规则。
+//! 公钥导入只确认编码被接受，不表示已验证任何签名或确认公钥持有者的身份。
 
 use sha2::{Digest, Sha256};
 use std::error::Error;
@@ -186,6 +188,260 @@ pub fn digest_reader<R: Read>(mut reader: R) -> Result<Sha256Digest, DigestError
         }
     }
     Ok(Sha256Digest(hasher.finalize().into()))
+}
+
+/// Ed25519 公钥，由 DER 编码的 SubjectPublicKeyInfo 导入。
+///
+/// 与 [`Sha256Digest`] 是两个明确区分的类型：公钥不是摘要，不能把公钥
+/// 当作摘要解析，也不能用摘要的十六进制解析入口还原公钥。文本表示固定
+/// 为 64 个小写十六进制字符（保留前导零，不含标签或换行），表示公钥
+/// 本身的 32 字节，**不是**公钥的 SHA-256 摘要。
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Ed25519PublicKey([u8; 32]);
+
+impl Ed25519PublicKey {
+    /// 从 DER 编码的 SubjectPublicKeyInfo（RFC 8410）原始字节导入公钥。
+    ///
+    /// 入参是**二进制**的公钥容器：恰好一份完整、规范的 DER 对象。
+    /// 裸公钥、十六进制文本和 PEM 文本都不属于本入口接受的格式，不做
+    /// 任何格式猜测或文本转换。
+    ///
+    /// 接受范围遵循 RFC 8410 对 Ed25519 公钥的规定：算法标识为
+    /// `1.3.101.112`，算法参数必须缺省（即使写成 NULL 也拒绝），公钥
+    /// 所在位串的未使用位数为零，公钥内容恰好 32 字节。截断数据、声明
+    /// 长度与实际内容不符、非规范长度编码、容器中出现多余字段或对象
+    /// 之后还有字节都返回 [`ImportPublicKeyError::Malformed`]，不忽略
+    /// 剩余内容，也不自动补齐。整体编码合法但算法标识不是 Ed25519 时
+    /// 返回 [`ImportPublicKeyError::UnsupportedAlgorithm`]，并保留实际
+    /// 标识供调用方展示。
+    ///
+    /// 导入成功只表示编码被接受：不表示已验证任何文件签名，也不表示
+    /// 确认了公钥持有者的身份。
+    pub fn from_spki_der(der: &[u8]) -> Result<Ed25519PublicKey, ImportPublicKeyError> {
+        const MALFORMED: ImportPublicKeyError = ImportPublicKeyError::Malformed;
+
+        // 外层：恰好一个 SEQUENCE，对象之后不允许有任何字节。
+        let (tag, spki, rest) = read_der_tlv(der).ok_or(MALFORMED)?;
+        if tag != TAG_SEQUENCE || !rest.is_empty() {
+            return Err(MALFORMED);
+        }
+        // SubjectPublicKeyInfo 内部：恰好 algorithm 与 subjectPublicKey 两项。
+        let (tag, algorithm, rest) = read_der_tlv(spki).ok_or(MALFORMED)?;
+        if tag != TAG_SEQUENCE {
+            return Err(MALFORMED);
+        }
+        let (tag, bit_string, rest) = read_der_tlv(rest).ok_or(MALFORMED)?;
+        if tag != TAG_BIT_STRING || !rest.is_empty() {
+            return Err(MALFORMED);
+        }
+        // AlgorithmIdentifier 内部：恰好一个 OID，没有任何参数——
+        // RFC 8410 要求参数缺省，写成 NULL 同样拒绝。
+        let (tag, oid_content, rest) = read_der_tlv(algorithm).ok_or(MALFORMED)?;
+        if tag != TAG_OID || !rest.is_empty() {
+            return Err(MALFORMED);
+        }
+        let algorithm_oid = decode_oid(oid_content).ok_or(MALFORMED)?;
+        // 位串：未使用位数为零，公钥内容恰好 32 字节。
+        let (&unused_bits, key) = bit_string.split_first().ok_or(MALFORMED)?;
+        if unused_bits != 0 || key.len() != 32 {
+            return Err(MALFORMED);
+        }
+
+        // 只有整体结构完整、DER 合法时才判断算法：编码已损坏的输入
+        // 一律报格式错误，不因局部看到其他算法标识而改报算法不支持。
+        if algorithm_oid.arcs() != [1, 3, 101, 112] {
+            return Err(ImportPublicKeyError::UnsupportedAlgorithm(algorithm_oid));
+        }
+
+        let mut bytes = [0u8; 32];
+        bytes.copy_from_slice(key);
+        Ok(Ed25519PublicKey(bytes))
+    }
+
+    /// 返回公钥的原始 32 字节。
+    pub fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+
+    /// 返回 64 个小写十六进制字符（保留前导零，不含标签或换行）。
+    ///
+    /// 这是公钥本身的文本表示，不是公钥的 SHA-256 摘要。
+    pub fn to_hex(&self) -> String {
+        let mut hex = String::with_capacity(64);
+        for byte in self.0 {
+            hex.push(char::from_digit((byte >> 4) as u32, 16).unwrap());
+            hex.push(char::from_digit((byte & 0x0f) as u32, 16).unwrap());
+        }
+        hex
+    }
+}
+
+impl fmt::Display for Ed25519PublicKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.to_hex())
+    }
+}
+
+impl fmt::Debug for Ed25519PublicKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "Ed25519PublicKey({self})")
+    }
+}
+
+/// 对象标识符（OID），以各段弧的数值保存，用于向调用方展示实际标识。
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ObjectIdentifier(Vec<u64>);
+
+impl ObjectIdentifier {
+    /// 返回各段弧的数值，例如 Ed25519 为 `[1, 3, 101, 112]`。
+    pub fn arcs(&self) -> &[u64] {
+        &self.0
+    }
+}
+
+impl fmt::Display for ObjectIdentifier {
+    /// 点分十进制写法，例如 `1.3.101.112`。
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut arcs = self.0.iter();
+        if let Some(first) = arcs.next() {
+            write!(f, "{first}")?;
+            for arc in arcs {
+                write!(f, ".{arc}")?;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// 导入 Ed25519 公钥失败时返回的类型化错误。
+///
+/// 调用方按变体即可区分两类失败，无需分析提示字符串：编码或公钥结构
+/// 不合法是 [`Malformed`](Self::Malformed)；结构完整、DER 合法但算法
+/// 标识不是 Ed25519 是 [`UnsupportedAlgorithm`](Self::UnsupportedAlgorithm)。
+/// 任何失败都不会产出可继续使用的公钥对象。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ImportPublicKeyError {
+    /// 输入不是一份完整、规范的 DER 编码 SubjectPublicKeyInfo：截断、
+    /// 声明长度与实际内容不符、非规范长度编码、算法参数未缺省（含写成
+    /// NULL）、位串未使用位数非零、公钥长度不是 32 字节、容器中出现
+    /// 多余字段或对象之后还有字节等。
+    Malformed,
+    /// 整体编码合法，但算法标识不是 Ed25519（`1.3.101.112`）；携带实际
+    /// 标识供调用方展示。
+    UnsupportedAlgorithm(ObjectIdentifier),
+}
+
+impl fmt::Display for ImportPublicKeyError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ImportPublicKeyError::Malformed => write!(
+                f,
+                "input is not a well-formed DER-encoded Ed25519 SubjectPublicKeyInfo"
+            ),
+            ImportPublicKeyError::UnsupportedAlgorithm(oid) => write!(
+                f,
+                "unsupported public key algorithm {oid} (expected Ed25519, 1.3.101.112)"
+            ),
+        }
+    }
+}
+
+impl Error for ImportPublicKeyError {}
+
+const TAG_SEQUENCE: u8 = 0x30;
+const TAG_OID: u8 = 0x06;
+const TAG_BIT_STRING: u8 = 0x03;
+
+/// 读取一个 DER TLV，返回（标签，内容，剩余字节）。
+///
+/// 只接受规范（最短）定长编码：拒绝不定长形式、长形式的前导零字节，
+/// 以及本可以用短形式表示的长度；声明长度超出实际剩余内容同样失败。
+/// 本模块只使用单字节通用标签，多字节标签形式一律拒绝。
+fn read_der_tlv(data: &[u8]) -> Option<(u8, &[u8], &[u8])> {
+    let (&tag, rest) = data.split_first()?;
+    if tag & 0x1f == 0x1f {
+        return None;
+    }
+    let (&first_len, rest) = rest.split_first()?;
+    let (len, rest) = if first_len & 0x80 == 0 {
+        (first_len as usize, rest)
+    } else {
+        let n = (first_len & 0x7f) as usize;
+        // 0x80 是不定长形式，DER 不允许；长度本身也不允许超过 8 字节。
+        if n == 0 || n > 8 || rest.len() < n {
+            return None;
+        }
+        let (len_bytes, rest) = rest.split_at(n);
+        // 前导零字节是非规范编码。
+        if len_bytes[0] == 0 {
+            return None;
+        }
+        let mut value: u64 = 0;
+        for &b in len_bytes {
+            value = (value << 8) | u64::from(b);
+        }
+        // 能用短形式表示的长度却用了长形式，同样是非规范编码。
+        if value < 128 {
+            return None;
+        }
+        (usize::try_from(value).ok()?, rest)
+    };
+    if rest.len() < len {
+        return None;
+    }
+    let (content, rest) = rest.split_at(len);
+    Some((tag, content, rest))
+}
+
+/// 把 OID 的 DER 内容字节解码为各段弧的数值。
+///
+/// 只接受规范编码：内容非空，每个子标识符按最短形式编码（不允许
+/// 前导的 0x80 字节），最后一个子标识符必须完整结束，弧的数值
+/// 不得溢出。
+fn decode_oid(content: &[u8]) -> Option<ObjectIdentifier> {
+    if content.is_empty() {
+        return None;
+    }
+    let mut subidentifiers: Vec<u64> = Vec::new();
+    let mut value: u64 = 0;
+    let mut in_arc = false;
+    for &b in content {
+        if !in_arc {
+            // 子标识符首字节为 0x80 是前导零的非规范编码。
+            if b == 0x80 {
+                return None;
+            }
+            in_arc = true;
+        }
+        if value > (u64::MAX >> 7) {
+            return None;
+        }
+        value = (value << 7) | u64::from(b & 0x7f);
+        if b & 0x80 == 0 {
+            subidentifiers.push(value);
+            value = 0;
+            in_arc = false;
+        }
+    }
+    // 最后一个子标识符的续位未结束：内容被截断。
+    if in_arc {
+        return None;
+    }
+    let (&first, rest) = subidentifiers.split_first()?;
+    // 第一个子标识符合并编码前两段弧：0..=39 → 0.x，40..=79 → 1.x，
+    // 其余 → 2.x。
+    let (arc0, arc1) = if first < 40 {
+        (0, first)
+    } else if first < 80 {
+        (1, first - 40)
+    } else {
+        (2, first - 80)
+    };
+    let mut arcs = Vec::with_capacity(rest.len() + 2);
+    arcs.push(arc0);
+    arcs.push(arc1);
+    arcs.extend_from_slice(rest);
+    Some(ObjectIdentifier(arcs))
 }
 
 #[cfg(test)]
@@ -702,5 +958,276 @@ mod tests {
         assert_ne!(len_err, char_err);
         let boxed: Box<dyn std::error::Error> = Box::new(char_err);
         assert!(boxed.to_string().contains("63"));
+    }
+
+    /// RFC 8410 第 4 节的 Ed25519 公钥示例（SubjectPublicKeyInfo 的 DER 编码）。
+    const RFC8410_SPKI: &[u8] = &[
+        0x30, 0x2a, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x03, 0x21, 0x00, 0xd7, 0x5a,
+        0x98, 0x01, 0x82, 0xb1, 0x0a, 0xb7, 0xd5, 0x4b, 0xfe, 0xd3, 0xc9, 0x64, 0x07, 0x3a,
+        0x0e, 0xe1, 0x72, 0xf3, 0xda, 0xa6, 0x23, 0x25, 0xaf, 0x02, 0x1a, 0x68, 0xf7, 0x07,
+        0x51, 0x1a,
+    ];
+
+    /// 同一示例的公钥原文（32 字节）。
+    const RFC8410_KEY_HEX: &str =
+        "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a";
+
+    /// 由算法 OID 内容字节与 32 字节公钥拼装一份规范编码的 SPKI。
+    fn spki_der(oid_content: &[u8], key: &[u8; 32]) -> Vec<u8> {
+        let mut der = vec![0x30, 0x2a, 0x30, (oid_content.len() + 2) as u8, 0x06];
+        der.push(oid_content.len() as u8);
+        der.extend_from_slice(oid_content);
+        der.extend_from_slice(&[0x03, 0x21, 0x00]);
+        der.extend_from_slice(key);
+        der
+    }
+
+    #[test]
+    fn imports_rfc8410_example_and_exposes_raw_bytes_and_hex() {
+        let key = Ed25519PublicKey::from_spki_der(RFC8410_SPKI).unwrap();
+
+        // 原始 32 字节就是位串里的公钥内容。
+        assert_eq!(key.as_bytes(), &RFC8410_SPKI[12..]);
+        // 文本表示是公钥本身的 64 个小写十六进制字符，不是公钥的 SHA-256 摘要。
+        assert_eq!(key.to_hex(), RFC8410_KEY_HEX);
+        assert_eq!(format!("{key}"), RFC8410_KEY_HEX);
+        assert_ne!(key.to_hex(), digest_reader(&RFC8410_SPKI[12..]).unwrap().to_hex());
+    }
+
+    #[test]
+    fn public_key_hex_is_64_lowercase_chars_and_keeps_leading_zeros() {
+        let mut raw = [0u8; 32];
+        raw[0] = 0x00;
+        raw[1] = 0x0a;
+        raw[31] = 0xff;
+        let key = Ed25519PublicKey::from_spki_der(&spki_der(&[0x2b, 0x65, 0x70], &raw)).unwrap();
+
+        let hex = key.to_hex();
+        assert_eq!(hex.len(), 64);
+        assert!(hex.starts_with("000a"));
+        assert!(hex.ends_with("ff"));
+        assert!(hex.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
+        assert!(!hex.chars().any(char::is_whitespace));
+    }
+
+    #[test]
+    fn public_keys_compare_by_value() {
+        let a = Ed25519PublicKey::from_spki_der(RFC8410_SPKI).unwrap();
+        let b = Ed25519PublicKey::from_spki_der(RFC8410_SPKI).unwrap();
+        let mut other_raw = [0u8; 32];
+        other_raw.copy_from_slice(&RFC8410_SPKI[12..]);
+        other_raw[31] ^= 0x01;
+        let c = Ed25519PublicKey::from_spki_der(&spki_der(&[0x2b, 0x65, 0x70], &other_raw))
+            .unwrap();
+
+        assert_eq!(a, b);
+        assert_ne!(a, c);
+        assert_eq!(a.as_bytes(), b.as_bytes());
+    }
+
+    #[test]
+    fn well_formed_non_ed25519_spki_reports_unsupported_algorithm_with_oid() {
+        // X25519（1.3.101.110）：结构完整、DER 合法，只是算法不是 Ed25519。
+        let der = spki_der(&[0x2b, 0x65, 0x6e], &[0x42; 32]);
+        let err = Ed25519PublicKey::from_spki_der(&der).unwrap_err();
+        match &err {
+            ImportPublicKeyError::UnsupportedAlgorithm(oid) => {
+                assert_eq!(oid.arcs(), &[1, 3, 101, 110]);
+                assert_eq!(oid.to_string(), "1.3.101.110");
+            }
+            other => panic!("expected UnsupportedAlgorithm, got {other:?}"),
+        }
+        assert!(err.to_string().contains("1.3.101.110"));
+    }
+
+    #[test]
+    fn null_algorithm_parameters_are_rejected_as_malformed() {
+        // 参数写成 NULL（05 00）而不是缺省：RFC 8410 不允许。
+        let mut der = vec![0x30, 0x2c, 0x30, 0x07, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x05, 0x00];
+        der.extend_from_slice(&[0x03, 0x21, 0x00]);
+        der.extend_from_slice(&[0x11; 32]);
+        assert_eq!(
+            Ed25519PublicKey::from_spki_der(&der).unwrap_err(),
+            ImportPublicKeyError::Malformed
+        );
+    }
+
+    #[test]
+    fn truncated_and_length_mismatched_inputs_are_malformed() {
+        // 整体截断：外层声明的 42 字节内容不完整。
+        assert_eq!(
+            Ed25519PublicKey::from_spki_der(&RFC8410_SPKI[..30]).unwrap_err(),
+            ImportPublicKeyError::Malformed
+        );
+        // 声明长度超过实际内容。
+        let mut der = RFC8410_SPKI.to_vec();
+        der[1] = 0x2b;
+        assert_eq!(
+            Ed25519PublicKey::from_spki_der(&der).unwrap_err(),
+            ImportPublicKeyError::Malformed
+        );
+        // 声明长度短于实际内容：对象之后还有字节，不能忽略剩余内容。
+        let mut der = RFC8410_SPKI.to_vec();
+        der[1] = 0x29;
+        der[3] = 0x04;
+        der.remove(9); // 同步收缩算法序列，让错误只来自外层长度
+        assert_eq!(
+            Ed25519PublicKey::from_spki_der(&der).unwrap_err(),
+            ImportPublicKeyError::Malformed
+        );
+        // 位串声明长度与公钥内容不符。
+        let mut der = RFC8410_SPKI.to_vec();
+        der[10] = 0x20;
+        assert_eq!(
+            Ed25519PublicKey::from_spki_der(&der).unwrap_err(),
+            ImportPublicKeyError::Malformed
+        );
+    }
+
+    #[test]
+    fn non_canonical_lengths_and_indefinite_form_are_malformed() {
+        // 长形式表达本可用短形式的长度（0x81 0x2a）：非规范。
+        let mut der = vec![0x30, 0x81, 0x2a];
+        der.extend_from_slice(&RFC8410_SPKI[2..]);
+        assert_eq!(
+            Ed25519PublicKey::from_spki_der(&der).unwrap_err(),
+            ImportPublicKeyError::Malformed
+        );
+        // 长形式带前导零字节：非规范。
+        let mut der = vec![0x30, 0x82, 0x00, 0x2a];
+        der.extend_from_slice(&RFC8410_SPKI[2..]);
+        assert_eq!(
+            Ed25519PublicKey::from_spki_der(&der).unwrap_err(),
+            ImportPublicKeyError::Malformed
+        );
+        // 不定长形式：DER 不允许。
+        let mut der = vec![0x30, 0x80];
+        der.extend_from_slice(&RFC8410_SPKI[2..]);
+        der.extend_from_slice(&[0x00, 0x00]);
+        assert_eq!(
+            Ed25519PublicKey::from_spki_der(&der).unwrap_err(),
+            ImportPublicKeyError::Malformed
+        );
+    }
+
+    #[test]
+    fn bit_string_and_key_size_rules_are_enforced() {
+        // 未使用位数非零。
+        let mut der = RFC8410_SPKI.to_vec();
+        der[11] = 0x01;
+        assert_eq!(
+            Ed25519PublicKey::from_spki_der(&der).unwrap_err(),
+            ImportPublicKeyError::Malformed
+        );
+        // 公钥只有 31 字节。
+        let mut der = spki_der(&[0x2b, 0x65, 0x70], &[0x22; 32]);
+        der[1] = 0x29;
+        der[10] = 0x20;
+        der.truncate(der.len() - 1);
+        assert_eq!(
+            Ed25519PublicKey::from_spki_der(&der).unwrap_err(),
+            ImportPublicKeyError::Malformed
+        );
+        // 公钥 33 字节。
+        let mut der = spki_der(&[0x2b, 0x65, 0x70], &[0x22; 32]);
+        der[1] = 0x2b;
+        der[10] = 0x22;
+        der.push(0x00);
+        assert_eq!(
+            Ed25519PublicKey::from_spki_der(&der).unwrap_err(),
+            ImportPublicKeyError::Malformed
+        );
+    }
+
+    #[test]
+    fn extra_fields_and_trailing_bytes_are_malformed() {
+        // 对象之后还有字节。
+        let mut der = RFC8410_SPKI.to_vec();
+        der.push(0x00);
+        assert_eq!(
+            Ed25519PublicKey::from_spki_der(&der).unwrap_err(),
+            ImportPublicKeyError::Malformed
+        );
+        // 外层容器中多出字段。
+        let mut der = spki_der(&[0x2b, 0x65, 0x70], &[0x33; 32]);
+        der[1] = 0x2e;
+        der.extend_from_slice(&[0x02, 0x01, 0x01]);
+        assert_eq!(
+            Ed25519PublicKey::from_spki_der(&der).unwrap_err(),
+            ImportPublicKeyError::Malformed
+        );
+    }
+
+    #[test]
+    fn raw_key_hex_text_and_pem_are_not_accepted_formats() {
+        // 裸公钥（32 字节本身）。
+        assert_eq!(
+            Ed25519PublicKey::from_spki_der(&RFC8410_SPKI[12..]).unwrap_err(),
+            ImportPublicKeyError::Malformed
+        );
+        // 十六进制文本。
+        assert_eq!(
+            Ed25519PublicKey::from_spki_der(RFC8410_KEY_HEX.as_bytes()).unwrap_err(),
+            ImportPublicKeyError::Malformed
+        );
+        // PEM 文本。
+        let pem = b"-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEA\n-----END PUBLIC KEY-----\n";
+        assert_eq!(
+            Ed25519PublicKey::from_spki_der(pem).unwrap_err(),
+            ImportPublicKeyError::Malformed
+        );
+        // 空输入。
+        assert_eq!(
+            Ed25519PublicKey::from_spki_der(b"").unwrap_err(),
+            ImportPublicKeyError::Malformed
+        );
+    }
+
+    #[test]
+    fn corrupted_encoding_is_malformed_even_with_foreign_oid_inside() {
+        // 结构损坏但局部能看到其他算法标识：必须报格式错误，
+        // 不能改报算法不支持。
+        let x25519 = spki_der(&[0x2b, 0x65, 0x6e], &[0x42; 32]);
+
+        // 截断的 X25519 SPKI。
+        let truncated = &x25519[..20];
+        assert_eq!(
+            Ed25519PublicKey::from_spki_der(truncated).unwrap_err(),
+            ImportPublicKeyError::Malformed
+        );
+        // 尾部多字节的 X25519 SPKI。
+        let mut trailing = x25519.clone();
+        trailing.push(0x00);
+        assert_eq!(
+            Ed25519PublicKey::from_spki_der(&trailing).unwrap_err(),
+            ImportPublicKeyError::Malformed
+        );
+        // 位串未使用位数非零的 X25519 SPKI。
+        let mut bad_bits = x25519.clone();
+        bad_bits[11] = 0x07;
+        assert_eq!(
+            Ed25519PublicKey::from_spki_der(&bad_bits).unwrap_err(),
+            ImportPublicKeyError::Malformed
+        );
+    }
+
+    #[test]
+    fn import_error_supports_display_and_error_trait() {
+        let malformed = Ed25519PublicKey::from_spki_der(b"\x30").unwrap_err();
+        assert!(malformed.to_string().contains("DER"));
+
+        let der = spki_der(&[0x2b, 0x65, 0x6e], &[0x42; 32]);
+        let unsupported = Ed25519PublicKey::from_spki_der(&der).unwrap_err();
+        let msg = unsupported.to_string();
+        assert!(msg.contains("1.3.101.110"));
+        assert!(msg.contains("1.3.101.112"));
+
+        // 两类失败可按变体区分，且都实现 std::error::Error，可常规传递。
+        fn assert_error<T: std::error::Error>(_: &T) {}
+        assert_error(&malformed);
+        assert_error(&unsupported);
+        assert_ne!(malformed, unsupported);
+        let boxed: Box<dyn std::error::Error> = Box::new(unsupported);
+        assert!(boxed.to_string().contains("1.3.101.110"));
     }
 }
