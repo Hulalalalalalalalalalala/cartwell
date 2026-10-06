@@ -6,7 +6,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-const USAGE: &str = "Usage: inkseal --version\n       inkseal digest <file>\n       inkseal check-digest <file> <digest>";
+const USAGE: &str = "Usage: inkseal --version\n       inkseal digest <file>\n       inkseal check-digest <file> <digest>\n       inkseal check-digest-file <file> <digest-file>";
 
 fn main() -> ExitCode {
     // 使用 args_os 而非 args：命令行参数是操作系统给出的原始字节，
@@ -34,6 +34,21 @@ fn main() -> ExitCode {
                 );
             };
             run_check_digest(Path::new(&path), &expected)
+        }
+        Some(ref cmd) if cmd.as_encoded_bytes() == b"check-digest-file" => {
+            let (Some(path), Some(digest_path), None) =
+                (args.next(), args.next(), args.next())
+            else {
+                return emit_error(
+                    2,
+                    format!(
+                        "inkseal: check-digest-file requires exactly two arguments: <file> <digest-file>\n\
+                         {USAGE}\n"
+                    )
+                    .as_bytes(),
+                );
+            };
+            run_check_digest_file(Path::new(&path), Path::new(&digest_path))
         }
         _ => {
             // 未知子命令（即便含有非 UTF-8 字节）等用法错误统一走这里。
@@ -257,18 +272,153 @@ fn run_check_digest(path: &Path, expected_arg: &OsStr) -> ExitCode {
     } else {
         // 内容不匹配：预期与实际都用库的同一显示规则呈现为
         // 64 个小写十六进制字符（大小写混用的输入也规范为小写）。
-        emit_error(
-            1,
-            format!(
-                "inkseal: digest mismatch for '{}'\n\
-                 expected: {}\n\
-                 actual:   {}\n",
-                path_display(path),
-                expected.to_hex(),
-                actual.to_hex()
-            )
-            .as_bytes(),
-        )
+        emit_error(1, mismatch_message(path, &expected, &actual).as_bytes())
+    }
+}
+
+/// 内容不匹配时的多行提示（含末尾换行）：指出待核对文件，并分别以库的
+/// 同一显示规则列出小写的预期摘要与实际摘要。`check-digest` 与
+/// `check-digest-file` 共用这一条提示规则。
+fn mismatch_message(path: &Path, expected: &Sha256Digest, actual: &Sha256Digest) -> String {
+    format!(
+        "inkseal: digest mismatch for '{}'\n\
+         expected: {}\n\
+         actual:   {}\n",
+        path_display(path),
+        expected.to_hex(),
+        actual.to_hex()
+    )
+}
+
+/// 读取并解析 `check-digest-file` 的摘要文件时的失败。
+///
+/// 三类失败必须区分，因为它们的退出码与提示不同：打不开、读取中途失败
+/// 是文件访问问题（退出码 `1`）；内容不符合“一份摘要加至多一个末尾
+/// 换行”的格式是用法/格式问题（退出码 `2`）。
+enum DigestFileError {
+    /// 摘要文件无法打开（不存在、权限不足等）；携带原始路径与系统原因。
+    Open(PathBuf, io::Error),
+    /// 摘要文件已打开但读取中途失败（在 Linux 上对目录调用 `read` 也会
+    /// 走到这里，返回 EISDIR）。
+    Read(PathBuf, io::Error),
+    /// 摘要文件内容不符合格式；携带原始路径与具体的格式问题说明。
+    Malformed(PathBuf, String),
+}
+
+impl DigestFileError {
+    /// 渲染为标准错误提示（含末尾换行）。路径仅在此时做损失性转换与控制
+    /// 字符转义；格式错误额外附上用法说明。
+    fn message(&self) -> String {
+        match self {
+            DigestFileError::Open(path, err) => {
+                format!(
+                    "inkseal: cannot open digest file '{}': {err}\n",
+                    path_display(path)
+                )
+            }
+            DigestFileError::Read(path, err) => {
+                format!(
+                    "inkseal: cannot read digest file '{}': {err}\n",
+                    path_display(path)
+                )
+            }
+            DigestFileError::Malformed(path, reason) => format!(
+                "inkseal: invalid digest file '{}': {reason}\n{USAGE}\n",
+                path_display(path)
+            ),
+        }
+    }
+}
+
+/// 打开摘要文件并读入其全部字节。
+///
+/// 这里不能用库的 [`digest_reader`](inkseal::digest_reader)：那会对摘要
+/// 文件本身再算一次摘要。我们需要的是文件里保存的原始字节，以便逐字节
+/// 判定它是否恰好保存了一份摘要（含第二个摘要、文件名等多余内容时必须
+/// 能看出来），而不是只取第一行。
+fn read_digest_file(path: &Path) -> Result<Sha256Digest, DigestFileError> {
+    use std::io::Read as _;
+
+    let mut file = File::open(path)
+        .map_err(|err| DigestFileError::Open(path.to_path_buf(), err))?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)
+        .map_err(|err| DigestFileError::Read(path.to_path_buf(), err))?;
+    parse_digest_file_bytes(&bytes)
+        .map_err(|reason| DigestFileError::Malformed(path.to_path_buf(), reason))
+}
+
+/// 摘要文件内容的唯一格式规则：
+///
+/// 恰好一份由 64 个 ASCII 十六进制字符组成的摘要（大小写可混用），其后
+/// 可以没有换行，也可以跟**一个** LF 或 CRLF。除此之外的任何内容都属于
+/// 格式错误：空文件、首尾空格、单独的 CR、额外空行、第二份摘要、附带的
+/// 文件名、`0x` 等前缀或非 ASCII 字节都不接受。这里不做任何裁剪或修正，
+/// 也不会只取第一行而忽略其后的内容。
+///
+/// 剥去至多一个末尾换行后，摘要正文严格复用库的
+/// [`Sha256Digest::from_hex_bytes`]——因此摘要值的解析、按值比较与再次
+/// 显示与 `check-digest` 参数走的是同一条严格规则，库接口也不受影响。
+fn parse_digest_file_bytes(bytes: &[u8]) -> Result<Sha256Digest, String> {
+    // 只允许末尾零个或一个换行：单个 LF，或紧位于该 LF 之前的一个 CR。
+    // 仅剥一次：第二个换行（额外空行）、不属于 CRLF 的单独 CR 都会留在
+    // 正文里，随后因长度/字符校验失败而被拒绝。
+    let body = match bytes {
+        [] => {
+            return Err(
+                "digest file is empty: it must contain exactly one digest of 64 ASCII \
+                 hexadecimal characters, with no line ending or one trailing LF/CRLF"
+                    .to_string(),
+            );
+        }
+        [rest @ .., b'\n'] => match rest {
+            [body @ .., b'\r'] => body,
+            body => body,
+        },
+        body => body,
+    };
+
+    Sha256Digest::from_hex_bytes(body).map_err(|err| match err {
+        ParseDigestError::InvalidLength(len) => format!(
+            "digest file must contain exactly 64 ASCII hexadecimal characters, with an \
+             optional single trailing LF or CRLF and nothing else; the digest text is \
+             {len} bytes"
+        ),
+        ParseDigestError::InvalidHexChar(pos) => format!(
+            "digest file must contain exactly 64 ASCII hexadecimal characters with an \
+             optional single trailing LF or CRLF; found a non-hexadecimal byte at offset {pos}"
+        ),
+    })
+}
+
+fn run_check_digest_file(path: &Path, digest_path: &Path) -> ExitCode {
+    // 先完整处理摘要文件，确认其格式合法之后才访问待核对文件：
+    // 摘要文件打不开/读失败是退出码 1，格式错误是退出码 2；这两种情况下
+    // 即使待核对文件也不存在，都绝不改报待核对文件的访问错误，也不进入
+    // 内容比较。
+    let expected = match read_digest_file(digest_path) {
+        Ok(digest) => digest,
+        Err(err) => {
+            let code = match err {
+                DigestFileError::Malformed(..) => 2,
+                DigestFileError::Open(..) | DigestFileError::Read(..) => 1,
+            };
+            return emit_error(code, err.message().as_bytes());
+        }
+    };
+
+    // 待核对文件沿用 digest/check-digest 的同一条文件访问规则：始终用
+    // 原始路径打开、按原始字节流式读取；访问失败是文件问题，绝不解释成
+    // 内容不匹配，也不给出部分摘要。
+    let actual = match digest_file(path) {
+        Ok(digest) => digest,
+        Err(err) => return emit_error(1, err.message().as_bytes()),
+    };
+
+    if actual == expected {
+        emit_success(b"OK\n")
+    } else {
+        emit_error(1, mismatch_message(path, &expected, &actual).as_bytes())
     }
 }
 
