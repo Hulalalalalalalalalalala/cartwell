@@ -974,7 +974,10 @@ mod tests {
 
     /// 由算法 OID 内容字节与 32 字节公钥拼装一份规范编码的 SPKI。
     fn spki_der(oid_content: &[u8], key: &[u8; 32]) -> Vec<u8> {
-        let mut der = vec![0x30, 0x2a, 0x30, (oid_content.len() + 2) as u8, 0x06];
+        // 外层内容 = 算法序列（2 字节头 + 2 字节 OID 头 + OID 内容）
+        //          + 位串（2 字节头 + 1 字节未使用位数 + 32 字节公钥）。
+        let outer_len = oid_content.len() + 4 + 35;
+        let mut der = vec![0x30, outer_len as u8, 0x30, (oid_content.len() + 2) as u8, 0x06];
         der.push(oid_content.len() as u8);
         der.extend_from_slice(oid_content);
         der.extend_from_slice(&[0x03, 0x21, 0x00]);
@@ -1179,6 +1182,84 @@ mod tests {
         // 空输入。
         assert_eq!(
             Ed25519PublicKey::from_spki_der(b"").unwrap_err(),
+            ImportPublicKeyError::Malformed
+        );
+    }
+
+    #[test]
+    fn multi_byte_oid_arc_reports_unsupported_with_original_arcs() {
+        // 1.3.101.200：最后一段 200 需要用两个字节（0x81 0x48）编码。
+        // 结构完整、DER 规范，只是算法不是 Ed25519。
+        let der = spki_der(&[0x2b, 0x65, 0x81, 0x48], &[0x42; 32]);
+        let err = Ed25519PublicKey::from_spki_der(&der).unwrap_err();
+        match &err {
+            ImportPublicKeyError::UnsupportedAlgorithm(oid) => {
+                // 多字节的一段必须还原为单个数值 200，不能拆成 1 与 72 两段。
+                assert_eq!(oid.arcs(), &[1, 3, 101, 200]);
+                assert_eq!(oid.to_string(), "1.3.101.200");
+            }
+            other => panic!("expected UnsupportedAlgorithm, got {other:?}"),
+        }
+        assert!(err.to_string().contains("1.3.101.200"));
+    }
+
+    #[test]
+    fn multi_byte_first_subidentifier_reports_unsupported_with_original_arcs() {
+        // 2.999.3：前两段合并为 2*40+999 = 1079，编码本身占两个字节
+        //（0x88 0x37），随后一段 3 为 0x03。
+        let der = spki_der(&[0x88, 0x37, 0x03], &[0x42; 32]);
+        let err = Ed25519PublicKey::from_spki_der(&der).unwrap_err();
+        match &err {
+            ImportPublicKeyError::UnsupportedAlgorithm(oid) => {
+                // 合并编码必须拆回前两段 2 与 999，不能当作单段或截断。
+                assert_eq!(oid.arcs(), &[2, 999, 3]);
+                assert_eq!(oid.to_string(), "2.999.3");
+            }
+            other => panic!("expected UnsupportedAlgorithm, got {other:?}"),
+        }
+        assert!(err.to_string().contains("2.999.3"));
+    }
+
+    #[test]
+    fn oid_longer_than_ed25519_prefix_keeps_every_arc_in_order() {
+        // 1.3.101.112.255.300：前缀与 Ed25519 相同但更长，整体仍是另一
+        // 个算法；255 编码为 0x81 0x7f，300 编码为 0x82 0x2c。
+        let der = spki_der(&[0x2b, 0x65, 0x70, 0x81, 0x7f, 0x82, 0x2c], &[0x42; 32]);
+        let err = Ed25519PublicKey::from_spki_der(&der).unwrap_err();
+        match &err {
+            ImportPublicKeyError::UnsupportedAlgorithm(oid) => {
+                // 不能只保留与 Ed25519 相同的前几段：每段数值与次序都保留。
+                assert_eq!(oid.arcs(), &[1, 3, 101, 112, 255, 300]);
+                assert_eq!(oid.to_string(), "1.3.101.112.255.300");
+            }
+            other => panic!("expected UnsupportedAlgorithm, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn malformed_oid_encodings_are_malformed_not_unsupported() {
+        // 算法标识为空：OID 内容长度为零。
+        let empty = spki_der(&[], &[0x42; 32]);
+        assert_eq!(
+            Ed25519PublicKey::from_spki_der(&empty).unwrap_err(),
+            ImportPublicKeyError::Malformed
+        );
+        // 末段子标识符的续位未结束：0x81 之后没有后续字节。
+        let unterminated = spki_der(&[0x2b, 0x81], &[0x42; 32]);
+        assert_eq!(
+            Ed25519PublicKey::from_spki_der(&unterminated).unwrap_err(),
+            ImportPublicKeyError::Malformed
+        );
+        // 非规范编码：子标识符以 0x80 开头（冗余前导零）。
+        let padded_arc = spki_der(&[0x2b, 0x80, 0x65, 0x70], &[0x42; 32]);
+        assert_eq!(
+            Ed25519PublicKey::from_spki_der(&padded_arc).unwrap_err(),
+            ImportPublicKeyError::Malformed
+        );
+        // 非规范编码出现在第一个子标识符（合并前两段处）同样拒绝。
+        let padded_first = spki_der(&[0x80, 0x2b, 0x65, 0x70], &[0x42; 32]);
+        assert_eq!(
+            Ed25519PublicKey::from_spki_der(&padded_first).unwrap_err(),
             ImportPublicKeyError::Malformed
         );
     }
