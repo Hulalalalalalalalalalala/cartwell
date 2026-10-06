@@ -211,9 +211,18 @@ impl Ed25519PublicKey {
     /// 所在位串的未使用位数为零，公钥内容恰好 32 字节。截断数据、声明
     /// 长度与实际内容不符、非规范长度编码、容器中出现多余字段或对象
     /// 之后还有字节都返回 [`ImportPublicKeyError::Malformed`]，不忽略
-    /// 剩余内容，也不自动补齐。整体编码合法但算法标识不是 Ed25519 时
-    /// 返回 [`ImportPublicKeyError::UnsupportedAlgorithm`]，并保留实际
-    /// 标识供调用方展示。
+    /// 剩余内容，也不自动补齐。
+    ///
+    /// 公钥长度是 Ed25519 专属的算法约束，只在算法已确认为 Ed25519
+    /// 之后检查。因此一份完整、规范但属于其他算法的容器——例如 RFC 8410
+    /// 的 Ed448 公钥（算法标识 `1.3.101.113`，公钥内容 57 字节）——
+    /// 不会因为长度不是 32 而被当成格式损坏，而是返回
+    /// [`ImportPublicKeyError::UnsupportedAlgorithm`]，携带实际标识
+    /// `1.3.101.113` 供调用方展示；调用方需要的是 Ed25519 公钥，应当
+    /// 更换公钥，而不是去“修复”这份本来就完整的编码。整体编码已损坏
+    /// （截断、长度不符、参数写成 NULL、未使用位数非零、对象之后还有
+    /// 字节等）时一律返回 [`ImportPublicKeyError::Malformed`]，即使局部
+    /// 能看到 Ed448 等其他算法标识，也不会改报算法不支持。
     ///
     /// 导入成功只表示编码被接受：不表示已验证任何文件签名，也不表示
     /// 确认了公钥持有者的身份。
@@ -241,9 +250,12 @@ impl Ed25519PublicKey {
             return Err(MALFORMED);
         }
         let algorithm_oid = decode_oid(oid_content).ok_or(MALFORMED)?;
-        // 位串：未使用位数为零，公钥内容恰好 32 字节。
+        // 位串的未使用位数为零是与算法无关的结构约束：非零就是编码损坏。
+        // 公钥长度则是 Ed25519 专属的算法约束，必须在确认算法之后再判断——
+        // 否则一份完整的 Ed448（公钥 57 字节）容器会被误报成格式损坏，
+        // 调用方无法区分“选错了算法”和“公钥文件真的坏了”。
         let (&unused_bits, key) = bit_string.split_first().ok_or(MALFORMED)?;
-        if unused_bits != 0 || key.len() != 32 {
+        if unused_bits != 0 {
             return Err(MALFORMED);
         }
 
@@ -253,9 +265,12 @@ impl Ed25519PublicKey {
             return Err(ImportPublicKeyError::UnsupportedAlgorithm(algorithm_oid));
         }
 
-        let mut bytes = [0u8; 32];
-        bytes.copy_from_slice(key);
-        Ok(Ed25519PublicKey(bytes))
+        // 算法确为 Ed25519：公钥内容必须恰好 32 字节，多一个少一个都是
+        // 格式错误，绝不截短或补齐后接受。
+        let Ok(key32) = <&[u8; 32]>::try_from(key) else {
+            return Err(MALFORMED);
+        };
+        Ok(Ed25519PublicKey(*key32))
     }
 
     /// 返回公钥的原始 32 字节。
@@ -323,11 +338,14 @@ impl fmt::Display for ObjectIdentifier {
 pub enum ImportPublicKeyError {
     /// 输入不是一份完整、规范的 DER 编码 SubjectPublicKeyInfo：截断、
     /// 声明长度与实际内容不符、非规范长度编码、算法参数未缺省（含写成
-    /// NULL）、位串未使用位数非零、公钥长度不是 32 字节、容器中出现
-    /// 多余字段或对象之后还有字节等。
+    /// NULL）、位串未使用位数非零、容器中出现多余字段或对象之后还有
+    /// 字节等；当算法标识确为 Ed25519（`1.3.101.112`）时，公钥长度不是
+    /// 32 字节也属于本变体。注意：其他算法容器里的公钥长度（例如
+    /// Ed448 的 57 字节）不作为格式问题——那属于
+    /// [`UnsupportedAlgorithm`](Self::UnsupportedAlgorithm)。
     Malformed,
     /// 整体编码合法，但算法标识不是 Ed25519（`1.3.101.112`）；携带实际
-    /// 标识供调用方展示。
+    /// 标识供调用方展示，例如一份完整的 Ed448（`1.3.101.113`）公钥。
     UnsupportedAlgorithm(ObjectIdentifier),
 }
 
@@ -972,15 +990,19 @@ mod tests {
     const RFC8410_KEY_HEX: &str =
         "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a";
 
-    /// 由算法 OID 内容字节与 32 字节公钥拼装一份规范编码的 SPKI。
-    fn spki_der(oid_content: &[u8], key: &[u8; 32]) -> Vec<u8> {
+    /// 由算法 OID 内容字节与任意长度公钥拼装一份规范编码的 SPKI：
+    /// 算法参数缺省，位串未使用位数为零。这里构造的容器都很小，
+    /// 各层长度均以短形式单字节编码。
+    fn spki_der(oid_content: &[u8], key: &[u8]) -> Vec<u8> {
         // 外层内容 = 算法序列（2 字节头 + 2 字节 OID 头 + OID 内容）
-        //          + 位串（2 字节头 + 1 字节未使用位数 + 32 字节公钥）。
-        let outer_len = oid_content.len() + 4 + 35;
+        //          + 位串（2 字节头 + 1 字节未使用位数 + 公钥）。
+        let outer_len = oid_content.len() + 4 + key.len() + 3;
         let mut der = vec![0x30, outer_len as u8, 0x30, (oid_content.len() + 2) as u8, 0x06];
         der.push(oid_content.len() as u8);
         der.extend_from_slice(oid_content);
-        der.extend_from_slice(&[0x03, 0x21, 0x00]);
+        der.push(0x03);
+        der.push((key.len() + 1) as u8);
+        der.push(0x00);
         der.extend_from_slice(key);
         der
     }
@@ -1041,6 +1063,118 @@ mod tests {
             other => panic!("expected UnsupportedAlgorithm, got {other:?}"),
         }
         assert!(err.to_string().contains("1.3.101.110"));
+    }
+
+    #[test]
+    fn well_formed_ed448_spki_reports_unsupported_algorithm_not_malformed() {
+        // RFC 8410 的 Ed448 公钥：算法 1.3.101.113（OID 内容 2b 65 71），
+        // 参数缺省，位串未使用位数为零，公钥内容恰好 57 字节。
+        let der = spki_der(&[0x2b, 0x65, 0x71], &[0x44; 57]);
+
+        // 独立核对这份构造的字节：一份完整、规范的二进制 SPKI——
+        // 外层 SEQUENCE 内容 67(0x43) = 算法序列 7 + 位串 60，
+        // 位串内容 58(0x3a) = 1 字节未使用位数 + 57 字节公钥，
+        // 全程短形式长度编码，无多余字段、无尾随字节。
+        let mut expected = vec![
+            0x30, 0x43, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x71, 0x03, 0x3a, 0x00,
+        ];
+        expected.extend_from_slice(&[0x44; 57]);
+        assert_eq!(der, expected);
+
+        let err = Ed25519PublicKey::from_spki_der(&der).unwrap_err();
+        match &err {
+            ImportPublicKeyError::UnsupportedAlgorithm(oid) => {
+                assert_eq!(oid.arcs(), &[1, 3, 101, 113]);
+                assert_eq!(oid.to_string(), "1.3.101.113");
+            }
+            other => panic!("expected UnsupportedAlgorithm for a valid Ed448 SPKI, got {other:?}"),
+        }
+        // 提示文字要显示实际标识，并说明这个入口需要 Ed25519。
+        let msg = err.to_string();
+        assert!(msg.contains("1.3.101.113"), "message must name Ed448: {msg}");
+        assert!(msg.contains("1.3.101.112"), "message must name Ed25519: {msg}");
+        assert!(msg.to_lowercase().contains("ed25519"), "message must say Ed25519: {msg}");
+    }
+
+    #[test]
+    fn foreign_algorithm_key_length_never_drives_classification() {
+        // 公钥长度只是 Ed25519 专属约束：Ed448 标识下无论公钥多长，
+        // 只要结构完整、DER 规范，都报算法不支持而不是格式错误——
+        // 57 字节（真正的 Ed448）如此，58 字节同样如此，调用方都应
+        // 理解为“换算法”，而不是“修复编码”。
+        for len in [57usize, 58] {
+            let der = spki_der(&[0x2b, 0x65, 0x71], &vec![0x44; len]);
+            match Ed25519PublicKey::from_spki_der(&der).unwrap_err() {
+                ImportPublicKeyError::UnsupportedAlgorithm(oid) => {
+                    assert_eq!(oid.arcs(), &[1, 3, 101, 113]);
+                }
+                other => panic!("key length {len} must not make Ed448 look malformed: {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn corrupted_ed448_containers_are_malformed_not_unsupported() {
+        // 完整的 Ed448 容器：识别出算法不能掩盖编码损坏。
+        let ed448 = spki_der(&[0x2b, 0x65, 0x71], &[0x44; 57]);
+        assert_eq!(ed448.len(), 69);
+
+        // 截断：外层声明的内容不完整。
+        assert_eq!(
+            Ed25519PublicKey::from_spki_der(&ed448[..30]).unwrap_err(),
+            ImportPublicKeyError::Malformed
+        );
+        // 声明长度超过实际内容。
+        let mut longer = ed448.clone();
+        longer[1] = 0x44;
+        assert_eq!(
+            Ed25519PublicKey::from_spki_der(&longer).unwrap_err(),
+            ImportPublicKeyError::Malformed
+        );
+        // 声明长度短于实际内容：完整对象之后还有字节，不能忽略。
+        let mut trailing = ed448.clone();
+        trailing[1] = 0x42;
+        assert_eq!(
+            Ed25519PublicKey::from_spki_der(&trailing).unwrap_err(),
+            ImportPublicKeyError::Malformed
+        );
+        // 对象之后直接多一个字节。
+        let mut extra = ed448.clone();
+        extra.push(0x00);
+        assert_eq!(
+            Ed25519PublicKey::from_spki_der(&extra).unwrap_err(),
+            ImportPublicKeyError::Malformed
+        );
+        // 位串声明长度与公钥内容不符（声称 59 字节内容，实际 58）。
+        let mut bad_bs_len = ed448.clone();
+        bad_bs_len[10] = 0x3b;
+        assert_eq!(
+            Ed25519PublicKey::from_spki_der(&bad_bs_len).unwrap_err(),
+            ImportPublicKeyError::Malformed
+        );
+        // 非规范 DER 长度编码：67 字节本可用短形式，却用了 0x81 0x43。
+        let mut non_canonical = vec![0x30, 0x81, 0x43];
+        non_canonical.extend_from_slice(&ed448[2..]);
+        assert_eq!(
+            Ed25519PublicKey::from_spki_der(&non_canonical).unwrap_err(),
+            ImportPublicKeyError::Malformed
+        );
+        // 参数写成 NULL（05 00）而不是缺省。
+        let mut null_params =
+            vec![0x30, 0x45, 0x30, 0x07, 0x06, 0x03, 0x2b, 0x65, 0x71, 0x05, 0x00];
+        null_params.extend_from_slice(&[0x03, 0x3a, 0x00]);
+        null_params.extend_from_slice(&[0x44; 57]);
+        assert_eq!(
+            Ed25519PublicKey::from_spki_der(&null_params).unwrap_err(),
+            ImportPublicKeyError::Malformed
+        );
+        // 位串未使用位数非零。
+        let mut unused_bits = ed448.clone();
+        unused_bits[11] = 0x07;
+        assert_eq!(
+            Ed25519PublicKey::from_spki_der(&unused_bits).unwrap_err(),
+            ImportPublicKeyError::Malformed
+        );
     }
 
     #[test]
