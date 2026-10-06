@@ -1992,6 +1992,408 @@ pub unsafe extern "C" fn read(fd: c_int, buf: *mut c_void, count: usize) -> isiz
         let entries = fs::read_dir(dir.path()).unwrap().count();
         assert_eq!(entries, 1, "no result files may be created");
     }
+
+    // ── check-digest-file：摘要文件本身的分段读取、临时中断与中途失败 ──────
+    //
+    // 摘要文件先于待核对文件处理：只有它被读到“明确的文件结束”并通过严格
+    // 格式判断之后，命令才允许打开待核对文件。因此“已经收到一行合法摘要”
+    // 绝不能提前触发核对——一次只读少量字节不是结束，EINTR 后必须继续读完；
+    // 已读前缀即便恰好是 64 个合法字符（或再带一个 LF/CRLF），随后真正的
+    // 读取错误仍是退出码 1 的读取失败，前缀不得被采用；多余字节在后续读取
+    // 中到达则是退出码 2 的格式错误，不能因分批到达而被忽略。
+    //
+    // 摘要文件是命令启动后打开的第一个普通文件（fd 3），下列脚本只精确
+    // 驱动它；待核对文件在摘要文件关闭后才打开（复用 fd 3），其读取全部
+    // 落在脚本耗尽后的透传阶段，不会被脚本误伤。
+    mod digest_file {
+        use super::*;
+
+        /// 在读取垫片脚本作用下运行 check-digest-file，两个流默认捕获。
+        fn run_check_file_shim(script: &str, target: &Path, digest_file: &Path) -> Output {
+            inkseal()
+                .arg("check-digest-file")
+                .arg(target)
+                .arg(digest_file)
+                .env("LD_PRELOAD", read_shim())
+                .env("INKSEAL_READ_SHIM", script)
+                .output()
+                .expect("failed to run inkseal")
+        }
+
+        /// 摘要文件已打开、读到部分内容后遭遇真正读取错误的完整约定：
+        /// 退出码 1（正常结束而非被信号杀死）、标准输出为空、标准错误是
+        /// 单行 `inkseal: cannot read digest file '<摘要文件路径>': <原因>`。
+        /// 即使已读前缀恰好是一份合法摘要（含允许的行尾），也不能输出 OK、
+        /// 不能改报内容不匹配或格式错误、不能泄露任何摘要值，也不得转去
+        /// 报告待核对文件的问题。
+        fn assert_digest_file_read_failure(output: &Output, digest_name: &str, reason: &str) {
+            assert_eq!(output.status.code(), Some(1), "exit code: {output:?}");
+            assert!(
+                output.status.code().is_some(),
+                "must end normally, not killed: {output:?}"
+            );
+            assert!(
+                output.stdout.is_empty(),
+                "stdout must stay empty on digest-file read failure: {:?}",
+                String::from_utf8_lossy(&output.stdout)
+            );
+            let stderr =
+                String::from_utf8(output.stderr.clone()).expect("stderr must be UTF-8");
+            assert!(
+                stderr.ends_with('\n') && !stderr[..stderr.len() - 1].contains('\n'),
+                "hint must be a single line: {stderr:?}"
+            );
+            assert!(
+                stderr.starts_with("inkseal: cannot read digest file '"),
+                "must report the digest file as unreadable, not the target: {stderr:?}"
+            );
+            assert!(
+                stderr.contains(digest_name),
+                "must name the digest file {digest_name:?}: {stderr:?}"
+            );
+            assert!(
+                stderr.contains(reason),
+                "must keep the specific OS cause {reason:?}: {stderr:?}"
+            );
+            for forbidden in [
+                "cannot open",
+                "mismatch",
+                "malformed",
+                "must contain exactly",
+                "unable to write",
+                "panicked",
+                "expected:",
+                "actual:",
+                "OK",
+                "Usage:",
+            ] {
+                assert!(
+                    !stderr.contains(forbidden),
+                    "{forbidden:?} must not appear in a digest-file read-failure hint: {stderr:?}"
+                );
+            }
+            // 已读到的前缀即便本身是合法摘要，任何 64 位十六进制摘要值
+            // （真实摘要或前缀摘要）都不得出现在提示里。
+            let leaks_digest = stderr
+                .split(|c: char| !c.is_ascii_hexdigit())
+                .any(|token| token.len() == 64);
+            assert!(
+                !leaks_digest,
+                "no digest value may appear in the hint: {stderr:?}"
+            );
+        }
+
+        /// 三种合法摘要文件形态：64 个十六进制字符且无尾换行、带单个 LF、
+        /// 带单个 CRLF；待核对文件均为内容匹配的 "abc"。
+        fn legal_forms(dir: &TestDir) -> Vec<(&'static str, PathBuf, usize)> {
+            [
+                ("bare", ABC_HEX.as_bytes().to_vec()),
+                ("lf", format!("{ABC_HEX}\n").into_bytes()),
+                ("crlf", format!("{ABC_HEX}\r\n").into_bytes()),
+            ]
+            .into_iter()
+            .map(|(label, bytes)| {
+                let len = bytes.len();
+                let path =
+                    dir.write_file(OsStr::new(&format!("digest-{label}.sha256")), &bytes);
+                (label, path, len)
+            })
+            .collect()
+        }
+
+        #[test]
+        fn one_byte_reads_without_trailing_newline_reach_explicit_eof() {
+            let dir = TestDir::new("cdf-read-byte-no-ending");
+            let target = dir.write_file(OsStr::new("hello.txt"), b"abc");
+            let digest_file = dir.write_file(OsStr::new("hello.sha256"), ABC_HEX.as_bytes());
+
+            // 全程每次只读到 1 个字节：连续 64 次短读都不能被当成文件结束，
+            // 必须再读到明确的 0 才确认这份无尾换行的摘要完整。
+            let script = vec!["s1"; ABC_HEX.len()].join(",");
+            let output = run_check_file_shim(&script, &target, &digest_file);
+
+            assert_check_ok(&output);
+        }
+
+        #[test]
+        fn one_byte_reads_keep_single_lf_line_ending_before_explicit_eof() {
+            let dir = TestDir::new("cdf-read-byte-lf");
+            let target = dir.write_file(OsStr::new("hello.txt"), b"abc");
+            let digest_file =
+                dir.write_file(OsStr::new("hello.sha256"), format!("{ABC_HEX}\n").as_bytes());
+
+            // digest 直接保存下来的形态：64 个字符加一个 LF，逐字节到达。
+            let script = vec!["s1"; 65].join(",");
+            let output = run_check_file_shim(&script, &target, &digest_file);
+
+            assert_check_ok(&output);
+        }
+
+        #[test]
+        fn cr_and_lf_arriving_in_separate_reads_still_form_one_crlf_ending() {
+            let dir = TestDir::new("cdf-read-split-crlf");
+            let target = dir.write_file(OsStr::new("hello.txt"), b"abc");
+            let digest_file = dir.write_file(
+                OsStr::new("hello.sha256"),
+                format!("{ABC_HEX}\r\n").as_bytes(),
+            );
+
+            // CR 与 LF 分两次读到时仍须识别为同一个 CRLF 行尾，不得把
+            // 单独到达的 CR 当成多余字节，也不得把随后的 LF 当成第二行。
+            for script in [
+                "s64,s1,s1", // 先整块摘要，再分别读 CR、LF
+                "s65,s1",    // 摘要与 CR 同一次读到，LF 单独读到
+                vec!["s1"; 66].join(",").as_str(), // 全部逐字节到达
+            ] {
+                let output = run_check_file_shim(script, &target, &digest_file);
+                assert_check_ok(&output);
+            }
+        }
+
+        #[test]
+        fn interruptions_anywhere_still_check_after_full_digest_file_read() {
+            let dir = TestDir::new("cdf-read-intr");
+            let target = dir.write_file(OsStr::new("hello.txt"), b"abc");
+
+            for (label, digest_file, len) in legal_forms(&dir) {
+                // 中断位置：首字节之前、正文之中、摘要正文读完但尾换行
+                // 尚未读到、CRLF 的 CR 与 LF 之间、全部内容读完但尚未确认
+                // 文件结束。每个场景都在显式 EOF 之前再追加一次中断。
+                for split_at in [0usize, 1, len / 2, len.saturating_sub(1), len] {
+                    let mut steps: Vec<String> =
+                        (0..split_at).map(|_| "s1".to_string()).collect();
+                    steps.push("i".to_string());
+                    steps.extend((split_at..len).map(|_| "s1".to_string()));
+                    steps.push("i".to_string());
+                    let output =
+                        run_check_file_shim(&steps.join(","), &target, &digest_file);
+                    assert_eq!(
+                        output.status.code(),
+                        Some(0),
+                        "{label} split={split_at}: {output:?}"
+                    );
+                    assert_eq!(output.stdout, b"OK\n", "{label} split={split_at}: {output:?}");
+                    assert!(
+                        output.stderr.is_empty(),
+                        "{label} split={split_at}: {:?}",
+                        String::from_utf8_lossy(&output.stderr)
+                    );
+                }
+
+                // 首字节前与确认 EOF 前连续多次中断也必须原地读完。
+                let mut storm = vec!["i".to_string(), "i".to_string()];
+                storm.extend((0..len).map(|_| "s1".to_string()));
+                storm.push("i".to_string());
+                storm.push("i".to_string());
+                let output = run_check_file_shim(&storm.join(","), &target, &digest_file);
+                assert_check_ok(&output);
+            }
+        }
+
+        #[test]
+        fn real_error_after_byte_by_byte_complete_digest_is_not_adopted() {
+            let dir = TestDir::new("cdf-read-fail-complete");
+            // 待核对文件确实匹配：制造“已读前缀已足以核对通过”的陷阱。
+            let target = dir.write_file(OsStr::new("hello.txt"), b"abc");
+
+            for (label, digest_file, len) in legal_forms(&dir) {
+                // 逐字节读完整个合法前缀（64 字节、64+LF、64+CRLF），
+                // 在尚未确认文件结束时注入真正的读取错误。
+                let mut steps: Vec<String> = (0..len).map(|_| "s1".to_string()).collect();
+                steps.push(format!("e{EIO}"));
+                let output = run_check_file_shim(&steps.join(","), &target, &digest_file);
+
+                assert_digest_file_read_failure(
+                    &output,
+                    &format!("digest-{label}.sha256"),
+                    EIO_REASON,
+                );
+                // 即使前缀恰好对应目标文件的真实摘要，也绝不能核对成功。
+                assert_ne!(output.stdout, b"OK\n", "{label}: {output:?}");
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                assert!(!stderr.contains(ABC_HEX), "{label}: {stderr:?}");
+            }
+        }
+
+        #[test]
+        fn real_error_amid_digest_body_is_read_failure_not_format_error() {
+            let dir = TestDir::new("cdf-read-fail-midbody");
+            // 待核对文件同时不存在：摘要文件读取失败时不得转去打开它。
+            let missing_target = dir.path().join("missing-target.bin");
+            let digest_file = dir.write_file(OsStr::new("digest.sha256"), ABC_HEX.as_bytes());
+
+            // 只读入 32 个字节（连一行合法摘要都不完整）就出现真正错误：
+            // 这是退出码 1 的读取失败，绝不能按“长度不足”判成退出码 2
+            // 的格式错误，也不能访问待核对文件。
+            let output =
+                run_check_file_shim(&format!("s16,s16,e{EIO}"), &missing_target, &digest_file);
+
+            assert_digest_file_read_failure(&output, "digest.sha256", EIO_REASON);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(!stderr.contains("missing-target.bin"), "{stderr:?}");
+        }
+
+        #[test]
+        fn read_failure_after_legal_prefix_reported_even_when_target_also_missing() {
+            let dir = TestDir::new("cdf-read-fail-both-missing");
+            let missing_target = dir.path().join("missing-target.bin");
+
+            for (label, digest_file, len) in legal_forms(&dir) {
+                let mut steps: Vec<String> = (0..len).map(|_| "s1".to_string()).collect();
+                steps.push(format!("e{EIO}"));
+                let output =
+                    run_check_file_shim(&steps.join(","), &missing_target, &digest_file);
+
+                // 只报告摘要文件的读取问题（退出码 1），不进入目标文件核对，
+                // 也不能因前缀合法而输出 OK 或改报格式错误。
+                assert_digest_file_read_failure(
+                    &output,
+                    &format!("digest-{label}.sha256"),
+                    EIO_REASON,
+                );
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                assert!(!stderr.contains("missing-target.bin"), "{label}: {stderr:?}");
+                assert!(!stderr.to_lowercase().contains("mismatch"), "{label}: {stderr:?}");
+            }
+        }
+
+        #[test]
+        fn later_real_error_after_interruptions_keeps_the_later_cause() {
+            let dir = TestDir::new("cdf-read-fail-cause");
+            let target = dir.write_file(OsStr::new("hello.txt"), b"abc");
+
+            // 先经历临时中断（首字节前、读入部分内容后各一次），再短读得到
+            // 完整的 64 字节合法前缀，随后才出现真正错误：提示必须反映后
+            // 一次失败的具体原因，而不是之前的 Interrupted，也不能改报格式
+            // 错误或内容不匹配。
+            let digest_file = dir.write_file(OsStr::new("digest.sha256"), ABC_HEX.as_bytes());
+            let output = run_check_file_shim(
+                &format!("i,s16,i,s48,e{EACCES}"),
+                &target,
+                &digest_file,
+            );
+            assert_digest_file_read_failure(&output, "digest.sha256", EACCES_REASON);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                !stderr.contains("Interrupted"),
+                "earlier EINTR must not be reported: {stderr:?}"
+            );
+            assert!(!stderr.contains("os error 4"), "{stderr:?}");
+            assert!(!stderr.contains(EIO_REASON), "{stderr:?}");
+
+            // 同一读取序列只把最终错误换成 EIO，提示中的原因随之改变：
+            // 原因取自最后一次真实失败，而非任何写死的措辞。
+            let output = run_check_file_shim(
+                &format!("i,s16,i,s48,e{EIO}"),
+                &target,
+                &digest_file,
+            );
+            assert_digest_file_read_failure(&output, "digest.sha256", EIO_REASON);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(!stderr.contains(EACCES_REASON), "{stderr:?}");
+        }
+
+        #[test]
+        fn extra_bytes_arriving_in_later_reads_are_malformed_not_ignored() {
+            let dir = TestDir::new("cdf-read-extra-late");
+            let target = dir.write_file(OsStr::new("hello.txt"), b"abc");
+            let missing_target = dir.path().join("missing-target.bin");
+
+            // 第一次读取都已拿到一份完整合法的摘要（含允许的行尾），多余
+            // 字节在“后续读取”中才到：分批到达不能让多余字节被忽略成 EOF。
+            let cases: Vec<(&str, Vec<u8>, &str)> = vec![
+                // 合法 LF 行尾已在手，下一次读取才来多余字节。
+                (
+                    "after-lf",
+                    format!("{ABC_HEX}\nx").into_bytes(),
+                    "s65,s1",
+                ),
+                // 合法 CRLF 行尾已在手，下一次读取才来多余字节。
+                (
+                    "after-crlf",
+                    format!("{ABC_HEX}\r\nx").into_bytes(),
+                    "s66,s1",
+                ),
+                // 第一行（digest 输出形态）完整到达后，第二份摘要的字节
+                // 才在后续读取（中间还夹一次中断）中出现：不能只取第一行。
+                (
+                    "second-line",
+                    format!("{ABC_HEX}\n{ABC_HEX}\n").into_bytes(),
+                    "s65,i,s1",
+                ),
+            ];
+
+            for (name, bytes, script) in cases {
+                let digest_name = format!("{name}.sha256");
+                let digest_file = dir.write_file(OsStr::new(&digest_name), &bytes);
+
+                // 待核对文件存在：退出码 2 的摘要文件格式错误，不进入核对。
+                assert_malformed_digest_file(
+                    &run_check_file_shim(script, &target, &digest_file),
+                    &digest_name,
+                    "hello.txt",
+                );
+                // 待核对文件不存在时仍只报摘要文件格式错误。
+                assert_malformed_digest_file(
+                    &run_check_file_shim(script, &missing_target, &digest_file),
+                    &digest_name,
+                    "missing-target.bin",
+                );
+            }
+        }
+
+        #[test]
+        fn same_legal_prefix_distinguishes_clean_eof_extra_byte_and_real_error() {
+            let dir = TestDir::new("cdf-read-boundary");
+            let target = dir.write_file(OsStr::new("hello.txt"), b"abc");
+
+            // 三种情形第一次读取都只拿到同样一份“完整且合法”的前缀；
+            // 下一次读取返回什么，必须导向三种完全不同的对外结果：
+            // 明确 EOF（0）→ 核对通过；多余字节 → 格式错误（2）；
+            // 真正错误 → 读取失败（1）。无尾换行、LF、CRLF 三种形态各验一遍。
+            for (label, ending, len) in [
+                ("bare", &b""[..], 64usize),
+                ("lf", &b"\n"[..], 65),
+                ("crlf", &b"\r\n"[..], 66),
+            ] {
+                let mut legal = ABC_HEX.as_bytes().to_vec();
+                legal.extend_from_slice(ending);
+                let mut with_extra = legal.clone();
+                with_extra.push(b'x');
+
+                let clean = dir.write_file(
+                    OsStr::new(&format!("clean-{label}.sha256")),
+                    &legal,
+                );
+                let extra = dir.write_file(
+                    OsStr::new(&format!("extra-{label}.sha256")),
+                    &with_extra,
+                );
+                let failing = dir.write_file(
+                    OsStr::new(&format!("fail-{label}.sha256")),
+                    &legal,
+                );
+
+                // 前缀之后透传读到明确 EOF：按完整内容核对，匹配目标。
+                let output = run_check_file_shim(&format!("s{len}"), &target, &clean);
+                assert_check_ok(&output);
+
+                // 前缀之后的下一次读取带来多余字节：严格格式判断拒绝它。
+                assert_malformed_digest_file(
+                    &run_check_file_shim(&format!("s{len},s1"), &target, &extra),
+                    &format!("extra-{label}.sha256"),
+                    "hello.txt",
+                );
+
+                // 前缀之后的下一次读取直接报真正错误：合法前缀不得被采用。
+                assert_digest_file_read_failure(
+                    &run_check_file_shim(&format!("s{len},e{EIO}"), &target, &failing),
+                    &format!("fail-{label}.sha256"),
+                    EIO_REASON,
+                );
+            }
+        }
+    }
 }
 
 // ── 临时受阻后完整交付（EINTR 与短写）─────────────────────────────────────────
