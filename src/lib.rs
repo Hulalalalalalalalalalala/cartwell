@@ -1,5 +1,5 @@
 //! inkseal 的库接口：对任意实现 [`std::io::Read`] 的输入计算 SHA-256 摘要，
-//! 以及导入 DER 编码（SubjectPublicKeyInfo）的 Ed25519 公钥。
+//! 以及导入 DER 编码（SubjectPublicKeyInfo）或 PEM 文本形式的 Ed25519 公钥。
 //!
 //! 摘要只取决于输入的原始字节，与命令行 `inkseal digest <文件>` 遵循同一内容规则。
 //! 公钥导入只确认编码被接受，不表示已验证任何签名或确认公钥持有者的身份。
@@ -190,7 +190,7 @@ pub fn digest_reader<R: Read>(mut reader: R) -> Result<Sha256Digest, DigestError
     Ok(Sha256Digest(hasher.finalize().into()))
 }
 
-/// Ed25519 公钥，由 DER 编码的 SubjectPublicKeyInfo 导入。
+/// Ed25519 公钥，由 DER 编码或 PEM 文本形式的 SubjectPublicKeyInfo 导入。
 ///
 /// 与 [`Sha256Digest`] 是两个明确区分的类型：公钥不是摘要，不能把公钥
 /// 当作摘要解析，也不能用摘要的十六进制解析入口还原公钥。文本表示固定
@@ -273,6 +273,40 @@ impl Ed25519PublicKey {
         Ok(Ed25519PublicKey(*key32))
     }
 
+    /// 从 PEM 文本（RFC 7468 的 `PUBLIC KEY` 块）的原始字节导入公钥。
+    ///
+    /// 入参是**文本形式**的公钥容器：文件的原始字节，恰好包含一份
+    /// `PUBLIC KEY` 块。块内 Base64 还原出的内容必须是一份完整、规范的
+    /// DER 编码 SubjectPublicKeyInfo，其结构、算法与公钥长度约束与
+    /// [`from_spki_der`](Self::from_spki_der) 完全相同——同一把公钥从
+    /// PEM 或 DER 导入得到相同的 32 字节，按值比较相等。二进制 DER、
+    /// 裸公钥和十六进制文本都不属于本入口接受的格式，不做任何格式猜测。
+    ///
+    /// 外层文本的接受范围：首行是 `-----BEGIN PUBLIC KEY-----`，末行是
+    /// `-----END PUBLIC KEY-----`，两个标记各占一行；正文是标准 Base64，
+    /// 可写成一行或多行，行结束接受 LF 和 CRLF；尾标记之后允许没有换行
+    /// 或只有一个换行。除此之外不做任何裁剪或修正：首标记之前和尾标记
+    /// 之后不接受任何其他内容（包括第二个块），正文中不接受空行、行内
+    /// 空格或制表符；Base64 的填充必须规范（总长为 4 的倍数、末尾至多
+    /// 两个 `=`、末尾未使用位为零），非法字符、缺少或多出填充、填充后
+    /// 继续出现编码字符都属于格式错误。私钥、证书等其他标签同样不接受。
+    ///
+    /// 失败分类与 [`from_spki_der`](Self::from_spki_der) 共用同一套：
+    /// PEM 标记或正文损坏，以及还原出的 DER 截断、长度不符或带多余字节，
+    /// 都返回 [`ImportPublicKeyError::Malformed`]，不产生公钥对象，也不
+    /// 忽略剩余内容；外层文本与 DER 均合法、算法却为 Ed448 或 X25519 等
+    /// 其他算法时，返回
+    /// [`ImportPublicKeyError::UnsupportedAlgorithm`] 并携带实际算法
+    /// 标识。DER 本身已损坏时仍报格式错误，不会因为读到了其他算法标识
+    /// 而改报算法不支持。
+    ///
+    /// 导入成功只表示编码被接受：不表示已验证任何文件签名，也不表示
+    /// 确认了公钥持有者的身份。
+    pub fn from_spki_pem(pem: &[u8]) -> Result<Ed25519PublicKey, ImportPublicKeyError> {
+        let der = decode_public_key_pem(pem).ok_or(ImportPublicKeyError::Malformed)?;
+        Ed25519PublicKey::from_spki_der(&der)
+    }
+
     /// 返回公钥的原始 32 字节。
     pub fn as_bytes(&self) -> &[u8; 32] {
         &self.0
@@ -330,13 +364,19 @@ impl fmt::Display for ObjectIdentifier {
 
 /// 导入 Ed25519 公钥失败时返回的类型化错误。
 ///
-/// 调用方按变体即可区分两类失败，无需分析提示字符串：编码或公钥结构
-/// 不合法是 [`Malformed`](Self::Malformed)；结构完整、DER 合法但算法
-/// 标识不是 Ed25519 是 [`UnsupportedAlgorithm`](Self::UnsupportedAlgorithm)。
+/// 两个导入入口（[`Ed25519PublicKey::from_spki_der`] 与
+/// [`Ed25519PublicKey::from_spki_pem`]）共用本类型，调用方按变体即可区分
+/// 两类失败，无需分析提示字符串：外层编码（PEM 文本或 DER 结构）或公钥
+/// 结构不合法是 [`Malformed`](Self::Malformed)；外层编码与 DER 都
+/// 合法但算法标识不是 Ed25519 是
+/// [`UnsupportedAlgorithm`](Self::UnsupportedAlgorithm)。
 /// 任何失败都不会产出可继续使用的公钥对象。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ImportPublicKeyError {
-    /// 输入不是一份完整、规范的 DER 编码 SubjectPublicKeyInfo：截断、
+    /// 输入不是一份完整、规范的公钥容器：对 PEM 入口是外层文本不合法
+    /// （标记缺失或损坏、标记之外还有其他内容、正文含空行或非法字符、
+    /// Base64 填充不规范等）；对两个入口也可能是还原出的 DER 不合法——
+    /// 截断、
     /// 声明长度与实际内容不符、非规范长度编码、算法参数未缺省（含写成
     /// NULL）、位串未使用位数非零、容器中出现多余字段或对象之后还有
     /// 字节等；当算法标识确为 Ed25519（`1.3.101.112`）时，公钥长度不是
@@ -473,6 +513,129 @@ fn decode_oid(content: &[u8]) -> Option<ObjectIdentifier> {
         arcs.push(u64::try_from(arc).ok()?);
     }
     Some(ObjectIdentifier(arcs))
+}
+
+/// `PUBLIC KEY` 块的首尾标记（RFC 7468）。
+const PEM_BEGIN: &[u8] = b"-----BEGIN PUBLIC KEY-----";
+const PEM_END: &[u8] = b"-----END PUBLIC KEY-----";
+
+/// 剥离末尾的一个行结束（LF 或 CRLF）；末尾不是 LF 时返回 `None`。
+fn strip_line_ending(s: &[u8]) -> Option<&[u8]> {
+    let s = s.strip_suffix(b"\n")?;
+    Some(s.strip_suffix(b"\r").unwrap_or(s))
+}
+
+/// 剥离开头的一个行结束（LF 或 CRLF）；开头不是行结束时返回 `None`。
+fn strip_leading_line_ending(s: &[u8]) -> Option<&[u8]> {
+    if let Some(rest) = s.strip_prefix(b"\r\n") {
+        Some(rest)
+    } else {
+        s.strip_prefix(b"\n")
+    }
+}
+
+/// 解析一份 PEM 文本（`PUBLIC KEY` 块）的原始字节，还原出其中的 DER 内容。
+///
+/// 只接受恰好一份块：首标记之前和尾标记之后（至多一个换行除外）不接受
+/// 任何内容；两个标记各占一行；正文是一行或多行标准 Base64，行结束接受
+///  LF 和 CRLF，不接受空行、行内空格或制表符；填充必须规范。任何一条不
+/// 满足都返回 `None`，由调用方统一报告为格式错误。
+fn decode_public_key_pem(pem: &[u8]) -> Option<Vec<u8>> {
+    // 尾标记之后允许没有换行或只有一个换行（LF 或 CRLF）。
+    let mut text = pem;
+    if let Some(rest) = text.strip_suffix(b"\n") {
+        text = rest.strip_suffix(b"\r").unwrap_or(rest);
+    }
+    // 尾标记独占一行：整体以它结束，且它前面是一个行结束。
+    let text = text.strip_suffix(PEM_END)?;
+    let text = strip_line_ending(text)?;
+    // 首标记独占一行：输入以它开始，且它后面紧跟一个行结束。
+    let text = text.strip_prefix(PEM_BEGIN)?;
+    let body = strip_leading_line_ending(text)?;
+
+    // 正文按行拆分：空行（含完全没有正文的空块）不接受；填充用的 `=`
+    // 只能出现在最后一行；每行只允许 Base64 字母表字符与 `=`，行内
+    // 空格、制表符和其他任何字节都是格式错误。
+    let lines: Vec<&[u8]> = body.split(|&b| b == b'\n').collect();
+    let last = lines.len() - 1;
+    let mut base64 = Vec::with_capacity(body.len());
+    for (i, raw_line) in lines.iter().enumerate() {
+        let line = raw_line.strip_suffix(b"\r").unwrap_or(raw_line);
+        if line.is_empty() {
+            return None;
+        }
+        if i != last && line.contains(&b'=') {
+            return None;
+        }
+        for &b in line {
+            if b != b'=' && base64_value(b).is_none() {
+                return None;
+            }
+        }
+        base64.extend_from_slice(line);
+    }
+    decode_base64_canonical(&base64)
+}
+
+/// 标准 Base64 字母表中一个字符对应的 6 位值；非字母表字符返回 `None`。
+fn base64_value(b: u8) -> Option<u8> {
+    match b {
+        b'A'..=b'Z' => Some(b - b'A'),
+        b'a'..=b'z' => Some(b - b'a' + 26),
+        b'0'..=b'9' => Some(b - b'0' + 52),
+        b'+' => Some(62),
+        b'/' => Some(63),
+        _ => None,
+    }
+}
+
+/// 把整段 Base64 文本（已按行拼接）解码为原始字节，只接受规范编码：
+/// 总长为 4 的倍数且非空；填充只能出现在末尾，至多两个 `=`；数据区不
+/// 含 `=`；由填充省去的末尾未使用位必须为零。缺少或多出填充、填充后
+/// 继续出现编码字符、未使用位非零都返回 `None`。
+fn decode_base64_canonical(text: &[u8]) -> Option<Vec<u8>> {
+    if text.is_empty() || text.len() % 4 != 0 {
+        return None;
+    }
+    let padding = text.iter().rev().take_while(|&&b| b == b'=').count();
+    if padding > 2 {
+        return None;
+    }
+    let data_len = text.len() - padding;
+    let mut values = Vec::with_capacity(data_len);
+    for &b in &text[..data_len] {
+        values.push(base64_value(b)?);
+    }
+    // 末尾未使用位必须为零：一个填充字符对应 2 位，两个对应 4 位。
+    match padding {
+        1 if values.last()? & 0x03 != 0 => return None,
+        2 if values.last()? & 0x0f != 0 => return None,
+        _ => {}
+    }
+    // 总长是 4 的倍数且填充至多两个，数据字符数只能是 4n、4n+2 或 4n+3。
+    let full = data_len / 4 * 4;
+    let mut out = Vec::with_capacity(data_len / 4 * 3 + 2);
+    for chunk in values[..full].chunks_exact(4) {
+        let n = u32::from(chunk[0]) << 18
+            | u32::from(chunk[1]) << 12
+            | u32::from(chunk[2]) << 6
+            | u32::from(chunk[3]);
+        out.extend_from_slice(&[(n >> 16) as u8, (n >> 8) as u8, n as u8]);
+    }
+    match data_len - full {
+        3 => {
+            let n = u32::from(values[full]) << 18
+                | u32::from(values[full + 1]) << 12
+                | u32::from(values[full + 2]) << 6;
+            out.extend_from_slice(&[(n >> 16) as u8, (n >> 8) as u8]);
+        }
+        2 => {
+            let n = u32::from(values[full]) << 18 | u32::from(values[full + 1]) << 12;
+            out.push((n >> 16) as u8);
+        }
+        _ => {}
+    }
+    Some(out)
 }
 
 #[cfg(test)]
@@ -1589,6 +1752,334 @@ mod tests {
         bad_bits[11] = 0x07;
         assert_eq!(
             Ed25519PublicKey::from_spki_der(&bad_bits).unwrap_err(),
+            ImportPublicKeyError::Malformed
+        );
+    }
+
+    // ----- PEM 文本导入（from_spki_pem）-----
+    //
+    // 这一组测试守住两条边界：外层 PEM 文本的严格格式（标记独占一行、
+    // 正文只允许规范 Base64、标记之外没有任何内容），以及 PEM 入口与
+    // DER 入口的分类一致性——外层或 DER 损坏一律 Malformed，外层与 DER
+    // 都合法但算法不是 Ed25519 才是 UnsupportedAlgorithm。
+
+    /// RFC 8410 第 4 节示例的 PEM 形式（与 RFC8410_SPKI 是同一容器）。
+    const RFC8410_PEM: &[u8] = b"-----BEGIN PUBLIC KEY-----\n\
+        MCowBQYDK2VwAyEA11qYAYKxCrfVS/7TyWQHOg7hcvPapiMlrwIaaPcHURo=\n\
+        -----END PUBLIC KEY-----\n";
+
+    /// 标准 Base64 编码（规范填充），测试里用来把任意 DER 包进 PEM。
+    fn base64_encode(data: &[u8]) -> String {
+        const ALPHABET: &[u8; 64] =
+            b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
+        for chunk in data.chunks(3) {
+            let n = u32::from(chunk[0]) << 16
+                | u32::from(*chunk.get(1).unwrap_or(&0)) << 8
+                | u32::from(*chunk.get(2).unwrap_or(&0));
+            out.push(ALPHABET[(n >> 18) as usize & 0x3f] as char);
+            out.push(ALPHABET[(n >> 12) as usize & 0x3f] as char);
+            out.push(if chunk.len() > 1 {
+                ALPHABET[(n >> 6) as usize & 0x3f] as char
+            } else {
+                '='
+            });
+            out.push(if chunk.len() > 2 {
+                ALPHABET[n as usize & 0x3f] as char
+            } else {
+                '='
+            });
+        }
+        out
+    }
+
+    /// 把一份 DER 包成单行正文的 PEM 文本（末尾带一个 LF）。
+    fn pem_of_der(der: &[u8]) -> Vec<u8> {
+        format!(
+            "-----BEGIN PUBLIC KEY-----\n{}\n-----END PUBLIC KEY-----\n",
+            base64_encode(der)
+        )
+        .into_bytes()
+    }
+
+    #[test]
+    fn pem_import_matches_der_import_for_the_same_key() {
+        // 独立核对测试用的编码器：对 RFC 示例的编码结果与文献中的 PEM 一致。
+        assert_eq!(pem_of_der(RFC8410_SPKI), RFC8410_PEM);
+
+        let from_pem = Ed25519PublicKey::from_spki_pem(RFC8410_PEM).unwrap();
+        let from_der = Ed25519PublicKey::from_spki_der(RFC8410_SPKI).unwrap();
+
+        // 同一把公钥从 PEM 或 DER 导入，得到相同的原始 32 字节，按值相等。
+        assert_eq!(from_pem, from_der);
+        assert_eq!(from_pem.as_bytes(), &RFC8410_SPKI[12..]);
+        // 十六进制显示仍是 64 个小写字符，前导零规则不变。
+        assert_eq!(from_pem.to_hex(), RFC8410_KEY_HEX);
+        assert_eq!(format!("{from_pem}"), RFC8410_KEY_HEX);
+    }
+
+    #[test]
+    fn pem_body_may_be_one_or_multiple_lines() {
+        let body = "MCowBQYDK2VwAyEA11qYAYKxCrfVS/7TyWQHOg7hcvPapiMlrwIaaPcHURo=";
+        let expected = Ed25519PublicKey::from_spki_der(RFC8410_SPKI).unwrap();
+
+        // 按 16 字符（4 的倍数）分行。
+        let aligned = format!(
+            "-----BEGIN PUBLIC KEY-----\n{}\n{}\n{}\n{}\n-----END PUBLIC KEY-----\n",
+            &body[..16],
+            &body[16..32],
+            &body[32..44],
+            &body[44..]
+        );
+        assert_eq!(Ed25519PublicKey::from_spki_pem(aligned.as_bytes()).unwrap(), expected);
+
+        // 分行位置不对齐 4 的倍数同样可以：拼接后的整体是规范 Base64。
+        let unaligned = format!(
+            "-----BEGIN PUBLIC KEY-----\n{}\n{}\n{}\n-----END PUBLIC KEY-----\n",
+            &body[..5],
+            &body[5..31],
+            &body[31..]
+        );
+        assert_eq!(Ed25519PublicKey::from_spki_pem(unaligned.as_bytes()).unwrap(), expected);
+    }
+
+    #[test]
+    fn pem_accepts_lf_or_crlf_and_optional_single_trailing_newline() {
+        let body = "MCowBQYDK2VwAyEA11qYAYKxCrfVS/7TyWQHOg7hcvPapiMlrwIaaPcHURo=";
+        let expected = Ed25519PublicKey::from_spki_der(RFC8410_SPKI).unwrap();
+
+        // 全程 CRLF，尾标记后没有换行。
+        let crlf = format!(
+            "-----BEGIN PUBLIC KEY-----\r\n{}\r\n-----END PUBLIC KEY-----",
+            body
+        );
+        assert_eq!(Ed25519PublicKey::from_spki_pem(crlf.as_bytes()).unwrap(), expected);
+        // 全程 CRLF，尾标记后再跟一个 CRLF。
+        let crlf_final = format!("{crlf}\r\n");
+        assert_eq!(Ed25519PublicKey::from_spki_pem(crlf_final.as_bytes()).unwrap(), expected);
+        // LF 行结束，尾标记后没有换行。
+        let lf_no_final = format!(
+            "-----BEGIN PUBLIC KEY-----\n{}\n-----END PUBLIC KEY-----",
+            body
+        );
+        assert_eq!(Ed25519PublicKey::from_spki_pem(lf_no_final.as_bytes()).unwrap(), expected);
+        // 混合行结束：首标记后 CRLF、正文后 LF，尾标记后一个 LF。
+        let mixed = format!(
+            "-----BEGIN PUBLIC KEY-----\r\n{}\n-----END PUBLIC KEY-----\n",
+            body
+        );
+        assert_eq!(Ed25519PublicKey::from_spki_pem(mixed.as_bytes()).unwrap(), expected);
+    }
+
+    #[test]
+    fn pem_rejects_anything_outside_the_single_block() {
+        let body = "MCowBQYDK2VwAyEA11qYAYKxCrfVS/7TyWQHOg7hcvPapiMlrwIaaPcHURo=";
+        let block = format!("-----BEGIN PUBLIC KEY-----\n{body}\n-----END PUBLIC KEY-----\n");
+
+        // 首标记之前的任何内容：空白、BOM、注释、另一行文本。
+        for bad in [
+            format!(" {block}"),
+            format!("\n{block}"),
+            format!("\u{feff}{block}"),
+            format!("# comment\n{block}"),
+        ] {
+            assert_eq!(
+                Ed25519PublicKey::from_spki_pem(bad.as_bytes()).unwrap_err(),
+                ImportPublicKeyError::Malformed
+            );
+        }
+        // 尾标记之后的任何内容：第二个块、多余空行（两个换行）、尾随文本。
+        for bad in [
+            format!("{block}{block}"),
+            format!("{block}\n"),
+            format!("{block} "),
+            format!("{block}-----BEGIN PUBLIC KEY-----\n"),
+        ] {
+            assert_eq!(
+                Ed25519PublicKey::from_spki_pem(bad.as_bytes()).unwrap_err(),
+                ImportPublicKeyError::Malformed
+            );
+        }
+    }
+
+    #[test]
+    fn pem_rejects_other_labels_and_damaged_markers() {
+        let body = "MCowBQYDK2VwAyEA11qYAYKxCrfVS/7TyWQHOg7hcvPapiMlrwIaaPcHURo=";
+        // 私钥、证书等其他标签不接受，也不猜测裸公钥或十六进制文本。
+        for bad in [
+            format!("-----BEGIN PRIVATE KEY-----\n{body}\n-----END PRIVATE KEY-----\n"),
+            format!("-----BEGIN CERTIFICATE-----\n{body}\n-----END CERTIFICATE-----\n"),
+            format!("-----BEGIN PUBLIC KEY-----\n{body}\n-----END PRIVATE KEY-----\n"),
+            // 标记没有独占一行。
+            format!("-----BEGIN PUBLIC KEY-----{body}\n-----END PUBLIC KEY-----\n"),
+            format!("-----BEGIN PUBLIC KEY-----\n{body}-----END PUBLIC KEY-----\n"),
+            format!("-----BEGIN PUBLIC KEY----- \n{body}\n-----END PUBLIC KEY-----\n"),
+            // 标记拼写不同（大小写、短横线数量）。
+            format!("-----BEGIN Public Key-----\n{body}\n-----END Public Key-----\n"),
+            format!("----BEGIN PUBLIC KEY----\n{body}\n----END PUBLIC KEY----\n"),
+        ] {
+            assert_eq!(
+                Ed25519PublicKey::from_spki_pem(bad.as_bytes()).unwrap_err(),
+                ImportPublicKeyError::Malformed,
+                "input must be rejected: {bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn pem_rejects_body_layout_violations() {
+        let body = "MCowBQYDK2VwAyEA11qYAYKxCrfVS/7TyWQHOg7hcvPapiMlrwIaaPcHURo=";
+        let (head, tail) = body.split_at(24);
+        for bad in [
+            // 空块：BEGIN 之后直接是 END。
+            "-----BEGIN PUBLIC KEY-----\n-----END PUBLIC KEY-----\n".to_string(),
+            // 正文中间的空行。
+            format!("-----BEGIN PUBLIC KEY-----\n{head}\n\n{tail}\n-----END PUBLIC KEY-----\n"),
+            // 正文末尾的空行。
+            format!("-----BEGIN PUBLIC KEY-----\n{body}\n\n-----END PUBLIC KEY-----\n"),
+            // 行内空格与制表符。
+            format!("-----BEGIN PUBLIC KEY-----\n{head} {tail}\n-----END PUBLIC KEY-----\n"),
+            format!("-----BEGIN PUBLIC KEY-----\n{head}\t{tail}\n-----END PUBLIC KEY-----\n"),
+            // 非法 Base64 字符（含非 ASCII 字节）。
+            format!("-----BEGIN PUBLIC KEY-----\n{head}*{tail}\n-----END PUBLIC KEY-----\n"),
+            format!("-----BEGIN PUBLIC KEY-----\n{head}\u{ff}{tail}\n-----END PUBLIC KEY-----\n"),
+            // 单独的 CR 不是行结束。
+            format!("-----BEGIN PUBLIC KEY-----\r{body}\n-----END PUBLIC KEY-----\n"),
+            format!("-----BEGIN PUBLIC KEY-----\n{body}\r-----END PUBLIC KEY-----\n"),
+        ] {
+            assert_eq!(
+                Ed25519PublicKey::from_spki_pem(bad.as_bytes()).unwrap_err(),
+                ImportPublicKeyError::Malformed,
+                "input must be rejected: {bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn pem_rejects_noncanonical_base64_padding_and_content() {
+        // 规范形式：总长 4 的倍数，填充在末尾且未使用位为零。
+        let body = "MCowBQYDK2VwAyEA11qYAYKxCrfVS/7TyWQHOg7hcvPapiMlrwIaaPcHURo=";
+        let (head, tail) = body.split_at(24);
+        for bad_body in [
+            // 缺少填充：总长不是 4 的倍数。
+            body.trim_end_matches('=').to_string(),
+            // 多出填充。
+            format!("{body}="),
+            format!("{body}==="),
+            // 填充出现在最后一行中间，其后还有编码字符。
+            format!("{head}=AAA{tail}"),
+            // 填充出现在非最后一行。
+            format!("{head}=\n{tail}"),
+            // 末尾未使用位非零：把最后一个编码字符 'o'（40，低 2 位为 0）
+            // 换成 'p'（41，低 2 位非零）。
+            format!("{}p=", &body[..body.len() - 2]),
+        ] {
+            let pem =
+                format!("-----BEGIN PUBLIC KEY-----\n{bad_body}\n-----END PUBLIC KEY-----\n");
+            assert_eq!(
+                Ed25519PublicKey::from_spki_pem(pem.as_bytes()).unwrap_err(),
+                ImportPublicKeyError::Malformed,
+                "body must be rejected: {bad_body:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn base64_decoder_enforces_canonical_form_directly() {
+        // 直接核对解码器的边界（这些输入经 PEM 入口同样都是格式错误，
+        // 但 DER 层也会拒绝它们，无法区分错误来自哪一层）。
+        assert_eq!(decode_base64_canonical(b""), None);
+        assert_eq!(decode_base64_canonical(b"A"), None);
+        assert_eq!(decode_base64_canonical(b"AQI"), None); // 缺填充
+        assert_eq!(decode_base64_canonical(b"AQ=="), Some(vec![0x01]));
+        assert_eq!(decode_base64_canonical(b"AR=="), None); // 未使用位非零
+        assert_eq!(decode_base64_canonical(b"AAE="), Some(vec![0x00, 0x01]));
+        assert_eq!(decode_base64_canonical(b"AAF="), None); // 未使用位非零
+        assert_eq!(decode_base64_canonical(b"AQ==="), None); // 多出填充
+        assert_eq!(decode_base64_canonical(b"===="), None);
+        assert_eq!(decode_base64_canonical(b"AQ=A"), None); // 数据区含 '='
+        assert_eq!(decode_base64_canonical(b"AAAA"), Some(vec![0x00, 0x00, 0x00]));
+        assert_eq!(decode_base64_canonical(b"AAA"), None);
+        // 与已知向量互验：RFC 8410 示例正文还原为完整 DER。
+        assert_eq!(
+            decode_base64_canonical(
+                b"MCowBQYDK2VwAyEA11qYAYKxCrfVS/7TyWQHOg7hcvPapiMlrwIaaPcHURo="
+            )
+            .as_deref(),
+            Some(RFC8410_SPKI)
+        );
+    }
+
+    #[test]
+    fn pem_with_valid_der_of_other_algorithm_reports_unsupported_with_oid() {
+        // 外层 PEM 与内部 DER 都合法，算法是 Ed448：保留算法不支持的分类
+        // 与实际标识，与 DER 入口一致。
+        let ed448 = spki_der(&[0x2b, 0x65, 0x71], &[0x44; 57]);
+        let err = Ed25519PublicKey::from_spki_pem(&pem_of_der(&ed448)).unwrap_err();
+        match &err {
+            ImportPublicKeyError::UnsupportedAlgorithm(oid) => {
+                assert_eq!(oid.arcs(), &[1, 3, 101, 113]);
+            }
+            other => panic!("expected UnsupportedAlgorithm, got {other:?}"),
+        }
+        assert!(err.to_string().contains("1.3.101.113"));
+
+        // X25519 同样。
+        let x25519 = spki_der(&[0x2b, 0x65, 0x6e], &[0x42; 32]);
+        let err = Ed25519PublicKey::from_spki_pem(&pem_of_der(&x25519)).unwrap_err();
+        match &err {
+            ImportPublicKeyError::UnsupportedAlgorithm(oid) => {
+                assert_eq!(oid.arcs(), &[1, 3, 101, 110]);
+            }
+            other => panic!("expected UnsupportedAlgorithm, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pem_with_corrupted_der_is_malformed_even_with_foreign_oid_inside() {
+        // 还原出的 DER 截断、长度不符或带多余字节：一律格式错误，
+        // 不因内部能看到 Ed448 标识而改报算法不支持。
+        let ed448 = spki_der(&[0x2b, 0x65, 0x71], &[0x44; 57]);
+        for der in [
+            ed448[..30].to_vec(),
+            ed448[..ed448.len() - 1].to_vec(),
+            ed448.iter().copied().chain([0x00]).collect(),
+        ] {
+            assert_eq!(
+                Ed25519PublicKey::from_spki_pem(&pem_of_der(&der)).unwrap_err(),
+                ImportPublicKeyError::Malformed
+            );
+        }
+        // Ed25519 容器被截断或多了字节同样如此。
+        for der in [
+            RFC8410_SPKI[..30].to_vec(),
+            RFC8410_SPKI.iter().copied().chain([0x00]).collect(),
+        ] {
+            assert_eq!(
+                Ed25519PublicKey::from_spki_pem(&pem_of_der(&der)).unwrap_err(),
+                ImportPublicKeyError::Malformed
+            );
+        }
+    }
+
+    #[test]
+    fn pem_entry_accepts_only_pem_and_der_entry_accepts_only_der() {
+        // PEM 入口不接受二进制 DER、裸公钥、十六进制文本或空输入。
+        let not_pem: [&[u8]; 4] = [
+            RFC8410_SPKI,
+            &RFC8410_SPKI[12..],
+            RFC8410_KEY_HEX.as_bytes(),
+            b"",
+        ];
+        for bad in not_pem {
+            assert_eq!(
+                Ed25519PublicKey::from_spki_pem(bad).unwrap_err(),
+                ImportPublicKeyError::Malformed
+            );
+        }
+        // DER 入口继续只接受 DER：PEM 文本仍是格式错误。
+        assert_eq!(
+            Ed25519PublicKey::from_spki_der(RFC8410_PEM).unwrap_err(),
             ImportPublicKeyError::Malformed
         );
     }

@@ -2,7 +2,7 @@
 
 当前版本提供命令行版本查询、单文件 SHA-256 摘要计算，以及用已保存的
 摘要核对文件内容。Rust 库除同一内容规则的摘要计算外，还提供 DER 编码
-Ed25519 公钥的导入（见“Rust 库接口”一节）。
+与 PEM 文本形式的 Ed25519 公钥导入（见“Rust 库接口”一节）。
 
 ## 构建与运行
 
@@ -241,8 +241,20 @@ assert_eq!(restored, computed);
 
 ### 导入 Ed25519 公钥
 
-`Ed25519PublicKey::from_spki_der` 从 **二进制**的 DER 编码
-SubjectPublicKeyInfo（RFC 8410）导入 Ed25519 公钥：
+公钥有两个导入入口，按手里文件的格式二选一，两个入口都不做任何
+格式猜测：
+
+- `Ed25519PublicKey::from_spki_der`：输入是**二进制**的 DER 编码
+  SubjectPublicKeyInfo（RFC 8410）。PEM 文本、十六进制文本和裸公钥
+  一律拒绝。
+- `Ed25519PublicKey::from_spki_pem`：输入是 **PEM 文本**（RFC 7468
+  的 `PUBLIC KEY` 块）的原始字节。二进制 DER、裸公钥和十六进制文本
+  一律拒绝。
+
+同一把公钥从 PEM 或 DER 导入，得到相同的原始 32 字节，两个结果按值
+比较相等。
+
+DER 入口的用法：
 
 ```rust
 use inkseal::Ed25519PublicKey;
@@ -262,6 +274,32 @@ assert_eq!(
     "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a"
 );
 ```
+
+PEM 入口接收文件的原始字节，与 DER 入口导入同一把公钥时结果相等：
+
+```rust
+use inkseal::Ed25519PublicKey;
+
+// 传入的是 PEM 文件的原始字节：恰好一份 PUBLIC KEY 块。
+let pem: &[u8] = b"-----BEGIN PUBLIC KEY-----\n\
+MCowBQYDK2VwAyEA11qYAYKxCrfVS/7TyWQHOg7hcvPapiMlrwIaaPcHURo=\n\
+-----END PUBLIC KEY-----\n";
+let key = Ed25519PublicKey::from_spki_pem(pem).unwrap();
+assert_eq!(
+    key.to_hex(),
+    "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a"
+);
+```
+
+PEM 文本的格式是严格的：首行 `-----BEGIN PUBLIC KEY-----`、末行
+`-----END PUBLIC KEY-----`，两个标记各占一行；正文是标准 Base64，
+可写成一行或多行，行结束接受 LF 和 CRLF；尾标记之后允许没有换行或
+只有一个换行。首标记之前和尾标记之后不接受任何其他内容（包括第二个
+块），正文中不接受空行、行内空格或制表符；Base64 的填充必须规范
+（总长为 4 的倍数、末尾至多两个 `=`、末尾未使用位为零），非法字符、
+缺少或多出填充、填充后继续出现编码字符都会被拒绝。私钥、证书等其他
+标签同样不接受。块内 Base64 还原出的内容必须满足与 DER 入口完全相同
+的结构、算法与公钥长度约束。
 
 **导入成功只表示编码被接受**：不表示已验证任何文件签名，也不表示
 确认了公钥持有者的身份。
@@ -292,15 +330,17 @@ assert_eq!(
 完整对象之后还有多余字节等）才报格式错误，即使容器内部带的是
 Ed448 标识也不例外。
 
-导入失败返回公开的类型化错误 `ImportPublicKeyError`，调用方按变体
-即可区分两类失败，无需分析提示字符串：
+两个入口的失败都返回公开的类型化错误 `ImportPublicKeyError`，调用方
+按变体即可区分两类失败，无需分析提示字符串：
 
-- `ImportPublicKeyError::Malformed`：编码或公钥结构不合法（包括
-  参数写成 NULL、位串未使用位数非零、容器中有多余字段或多余字节、
-  非规范长度编码等）；算法标识确为 Ed25519 时公钥长度不是 32 字节
-  也属于这一类。
-- `ImportPublicKeyError::UnsupportedAlgorithm(oid)`：结构完整、
-  DER 合法，但算法标识不是 Ed25519；`oid` 保留实际标识（可显示为
+- `ImportPublicKeyError::Malformed`：编码或公钥结构不合法——对 PEM
+  入口包括外层文本不合法（标记缺失或损坏、标记之外还有其他内容、
+  正文含空行或非法字符、Base64 填充不规范等），对两个入口也包括
+  还原出的 DER 不合法（参数写成 NULL、位串未使用位数非零、容器中有
+  多余字段或多余字节、非规范长度编码等）；算法标识确为 Ed25519 时
+  公钥长度不是 32 字节也属于这一类。
+- `ImportPublicKeyError::UnsupportedAlgorithm(oid)`：外层编码与 DER
+  都合法，但算法标识不是 Ed25519；`oid` 保留实际标识（可显示为
   点分形式，如 X25519 的 `1.3.101.110`、Ed448 的 `1.3.101.113`）
   供调用方展示。这意味着要换一把所需算法的公钥，而不是修复编码。
   整体编码已损坏的输入一律返回 `Malformed`，不会因为局部看到其他
