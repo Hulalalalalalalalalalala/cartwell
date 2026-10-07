@@ -2862,4 +2862,181 @@ mod tests {
         }
         assert_eq!(h(&a), h(&b));
     }
+
+    // ----- 换行不放宽 Base64 末尾填充规则 -----
+    //
+    // 这一组回归保障守住一条边界：正文的合法分行只改变文本排布，不改变
+    // 导入结果；但换行也绝不放宽 Base64 的末尾规则——末尾四元组中未使用
+    // 位非零（宽松解码仍能得到同一份 DER 的写法）、缺填充、多填充、填充
+    // 后编码“重新开始”，无论单行还是跨行都必须经公开入口归为 Malformed。
+    // 对其他算法（X25519）同样：正文规范才报 UnsupportedAlgorithm，正文
+    // 不规范一律 Malformed，不能借读到的算法标识掩盖外层编码问题。
+
+    #[test]
+    fn pem_line_breaks_inside_base64_groups_do_not_change_the_key() {
+        // 与 DER 入口导入的公钥按值相等、原始 32 字节一致——核对的是
+        // 公钥的实际值，不是“没有报错”。
+        let expected = Ed25519PublicKey::from_spki_der(RFC8410_SPKI).unwrap();
+        let body = RFC8410_PEM_BODY.as_bytes();
+        assert_eq!(body.len(), 60);
+
+        // 单行基线（LF、尾无换行）。
+        let key = Ed25519PublicKey::from_spki_pem(&pem_single_line(body)).unwrap();
+        assert_eq!(key, expected);
+        assert_eq!(key.as_bytes(), &RFC8410_SPKI[12..]);
+
+        // 在编码组（4 字符一组）内部换行：切点都不是 4 的倍数，包括切在
+        // 最后一个四元组内部、把填充符单独留到下一行。LF 与 CRLF 都接受。
+        for cut in [1usize, 2, 3, 5, 7, 13, 31, 57, 58, 59] {
+            for eol in [&b"\n"[..], &b"\r\n"[..]] {
+                let pem = pem_build(&[&body[..cut], &body[cut..]], eol, eol);
+                let key = Ed25519PublicKey::from_spki_pem(&pem).unwrap();
+                assert_eq!(key, expected, "cut at {cut}, eol {eol:?}");
+                assert_eq!(key.as_bytes(), &RFC8410_SPKI[12..]);
+                assert_eq!(key.to_hex(), RFC8410_KEY_HEX);
+            }
+        }
+
+        // 多行、每行长度都不是 4 的倍数、填充符独占一行、CRLF 行结束。
+        let pem = pem_build(
+            &[&body[..7], &body[7..33], &body[33..59], &body[59..]],
+            b"\r\n",
+            b"\r\n",
+        );
+        let key = Ed25519PublicKey::from_spki_pem(&pem).unwrap();
+        assert_eq!(key, expected);
+        assert_eq!(key.as_bytes(), &RFC8410_SPKI[12..]);
+    }
+
+    #[test]
+    fn pem_rejects_nonzero_unused_bits_in_last_quartet_single_or_multi_line() {
+        // 规范正文的最后一个四元组是 "URo="：单填充时第三个字符的低 2 位
+        // 是未使用位，'o'（40 = 0b101000）的未使用位为零。把它改成 'p'
+        //（41 = 0b101001）后，字母表、填充数量、公钥容器全都正确，宽松
+        // 解码仍还原出同一份 DER——这正是必须拒绝的非规范输入。
+        let canonical = RFC8410_PEM_BODY.as_bytes();
+        assert_eq!(&canonical[56..], b"URo=");
+        let mut lax = canonical.to_vec();
+        lax[58] = b'p';
+        // 自检：两处改动只差在未使用位，高位（实际数据位）完全相同。
+        assert_eq!(b64_value(b'o').unwrap() & 0b11, 0);
+        assert_eq!(b64_value(b'p').unwrap() & 0b11, 1);
+        assert_eq!(b64_value(b'o').unwrap() >> 2, b64_value(b'p').unwrap() >> 2);
+
+        // 单行：必须 Malformed，不能返回公钥。
+        assert_eq!(
+            Ed25519PublicKey::from_spki_pem(&pem_single_line(&lax)).unwrap_err(),
+            ImportPublicKeyError::Malformed
+        );
+        // 跨行：损坏的四元组被行结束拆开（含填充符独占一行），结论不变——
+        // 换行不能让宽松写法变得可接受。
+        for cut in [56usize, 57, 58, 59] {
+            let pem = pem_build(&[&lax[..cut], &lax[cut..]], b"\n", b"\n");
+            assert_eq!(
+                Ed25519PublicKey::from_spki_pem(&pem).unwrap_err(),
+                ImportPublicKeyError::Malformed,
+                "cut at {cut}"
+            );
+        }
+        let pem = pem_build(&[&lax[..20], &lax[20..58], &lax[58..]], b"\r\n", b"");
+        assert_eq!(
+            Ed25519PublicKey::from_spki_pem(&pem).unwrap_err(),
+            ImportPublicKeyError::Malformed
+        );
+    }
+
+    #[test]
+    fn pem_padding_rules_are_not_relaxed_by_line_breaks() {
+        let body = RFC8410_PEM_BODY.as_bytes(); // 60 字符，末尾一个 '='
+
+        // 缺填充（59 字符）：单行、拆成两行、CRLF 行结束都一样拒绝。
+        for pem in [
+            pem_single_line(&body[..59]),
+            pem_build(&[&body[..20], &body[20..59]], b"\n", b"\n"),
+            pem_build(&[&body[..59]], b"\r\n", b""),
+        ] {
+            assert_eq!(
+                Ed25519PublicKey::from_spki_pem(&pem).unwrap_err(),
+                ImportPublicKeyError::Malformed
+            );
+        }
+        // 多填充（61 字符）：单行，或把多出的 '=' 放到下一行。
+        let mut extra = body.to_vec();
+        extra.push(b'=');
+        for pem in [
+            pem_single_line(&extra),
+            pem_build(&[body, &b"="[..]], b"\n", b"\n"),
+        ] {
+            assert_eq!(
+                Ed25519PublicKey::from_spki_pem(&pem).unwrap_err(),
+                ImportPublicKeyError::Malformed
+            );
+        }
+        // 填充之后编码不能“重新开始”：`=` 结束后同一行或下一行又出现
+        // 编码字符，换行不能让已经结束的编码继续。
+        for pem in [
+            pem_build(&[body, &b"QUJD"[..]], b"\n", b"\n"),
+            pem_single_line(b"QQ==QQ=="),
+            pem_build(&[&b"QQ=="[..], &b"QQ=="[..]], b"\n", b"\n"),
+            pem_build(&[&body[..59], &b"="[..], &b"QUJD"[..]], b"\r\n", b""),
+        ] {
+            assert_eq!(
+                Ed25519PublicKey::from_spki_pem(&pem).unwrap_err(),
+                ImportPublicKeyError::Malformed
+            );
+        }
+    }
+
+    #[test]
+    fn x25519_pem_reports_unsupported_only_when_base64_is_canonical() {
+        // 同样需要末尾填充的 X25519（1.3.101.110）容器：44 字节 DER，
+        // 规范 Base64 正文 60 字符、末尾一个 '='，末四元组为 "QkI="，
+        // 'I'（8 = 0b001000）的未使用位（低 2 位）为零。
+        let x25519 = spki_der(&[0x2b, 0x65, 0x6e], &[0x42; 32]);
+        assert_eq!(x25519.len(), 44);
+        let body = b64encode_test(&x25519).into_bytes();
+        assert_eq!(body.len(), 60);
+        assert_eq!(&body[56..], b"QkI=");
+
+        // 正文规范：外层与 DER 都合法，只是算法不是 Ed25519——
+        // UnsupportedAlgorithm，并保留算法标识 1.3.101.110。
+        match Ed25519PublicKey::from_spki_pem(&pem_single_line(&body)).unwrap_err() {
+            ImportPublicKeyError::UnsupportedAlgorithm(oid) => {
+                assert_eq!(oid.arcs(), &[1, 3, 101, 110]);
+                assert_eq!(oid.to_string(), "1.3.101.110");
+            }
+            other => panic!("expected UnsupportedAlgorithm, got {other:?}"),
+        }
+
+        // 只把末尾四元组的未使用位改成非零（'I' → 'J'，8 → 9）：宽松解码
+        // 仍得到同一份 DER，但这样的正文是外层编码问题，必须 Malformed，
+        // 不能改报算法不支持；单行与跨行结论一致。
+        let mut lax = body.clone();
+        lax[58] = b'J';
+        assert_eq!(b64_value(b'I').unwrap() & 0b11, 0);
+        assert_eq!(b64_value(b'J').unwrap() & 0b11, 1);
+        for pem in [
+            pem_single_line(&lax),
+            pem_build(&[&lax[..56], &lax[56..]], b"\n", b"\n"),
+            pem_build(&[&lax[..58], &lax[58..]], b"\r\n", b""),
+        ] {
+            assert_eq!(
+                Ed25519PublicKey::from_spki_pem(&pem).unwrap_err(),
+                ImportPublicKeyError::Malformed
+            );
+        }
+
+        // 缺填充、多填充同样是外层编码问题：Malformed，不是算法不支持。
+        // 任何失败都不会产出可继续使用的公钥。
+        assert_eq!(
+            Ed25519PublicKey::from_spki_pem(&pem_single_line(&body[..59])).unwrap_err(),
+            ImportPublicKeyError::Malformed
+        );
+        let mut extra = body.clone();
+        extra.push(b'=');
+        assert_eq!(
+            Ed25519PublicKey::from_spki_pem(&pem_single_line(&extra)).unwrap_err(),
+            ImportPublicKeyError::Malformed
+        );
+    }
 }
