@@ -1612,4 +1612,505 @@ mod tests {
         let boxed: Box<dyn std::error::Error> = Box::new(unsupported);
         assert!(boxed.to_string().contains("1.3.101.110"));
     }
+
+    // ----- DER 长度编码（短形式/长形式）的回归保障 -----
+    //
+    // 这一组测试只走公开入口 from_spki_der，守住一条边界：容器内容从 127
+    // 字节增到 128 字节、长度字段从短形式变成最短长形式时，“结构合法但
+    // 算法不是 Ed25519 → UnsupportedAlgorithm”与“编码损坏 → Malformed”
+    // 的区分不能改变。外层 SEQUENCE、算法标识所在 SEQUENCE、公钥位串三个
+    // 位置适用同一条规则。
+
+    /// 构造测试输入时某一层 TLV 长度字段的写法。
+    #[derive(Clone, Copy)]
+    enum LenStyle {
+        /// 规范最短形式：127 以内短形式，128 起最短长形式。
+        Canonical,
+        /// 长度小于 128 也写成长形式——本可用短形式，属于非规范编码。
+        ForcedLong,
+        /// 长形式数字前再补一个零字节——冗余前导零，属于非规范编码。
+        ForcedLongZeroPadded,
+    }
+
+    /// 按指定风格生成一个 DER 长度字段的字节。
+    fn test_len_bytes(len: usize, style: LenStyle) -> Vec<u8> {
+        let mut base256 = Vec::new();
+        let mut v = len;
+        loop {
+            base256.push((v & 0xff) as u8);
+            v >>= 8;
+            if v == 0 {
+                break;
+            }
+        }
+        base256.reverse();
+        match style {
+            LenStyle::Canonical if len < 128 => vec![len as u8],
+            LenStyle::Canonical | LenStyle::ForcedLong => {
+                let mut out = vec![0x80 | base256.len() as u8];
+                out.extend_from_slice(&base256);
+                out
+            }
+            LenStyle::ForcedLongZeroPadded => {
+                let mut out = vec![0x80 | (base256.len() + 1) as u8, 0x00];
+                out.extend_from_slice(&base256);
+                out
+            }
+        }
+    }
+
+    /// 用指定的长度风格拼一个 TLV；内容本身原样放入。
+    fn test_tlv(tag: u8, content: &[u8], style: LenStyle) -> Vec<u8> {
+        let mut out = vec![tag];
+        out.extend_from_slice(&test_len_bytes(content.len(), style));
+        out.extend_from_slice(content);
+        out
+    }
+
+    /// 拼装一份 SPKI：算法参数缺省、位串未使用位数为零；三层 TLV 的长度
+    /// 字段风格可分别指定。OID 自身始终按规范短形式编码（这些用例里 OID
+    /// 内容都不超过 127 字节）。
+    fn styled_spki(
+        oid_content: &[u8],
+        key: &[u8],
+        outer_style: LenStyle,
+        alg_style: LenStyle,
+        bs_style: LenStyle,
+    ) -> Vec<u8> {
+        let oid = test_tlv(TAG_OID, oid_content, LenStyle::Canonical);
+        let algorithm = test_tlv(TAG_SEQUENCE, &oid, alg_style);
+        let mut bs_content = vec![0x00];
+        bs_content.extend_from_slice(key);
+        let bit_string = test_tlv(TAG_BIT_STRING, &bs_content, bs_style);
+        let mut outer_content = algorithm;
+        outer_content.extend_from_slice(&bit_string);
+        test_tlv(TAG_SEQUENCE, &outer_content, outer_style)
+    }
+
+    /// 断言一份结构完整的容器被归类为“算法不支持”，且 OID 原样保留。
+    fn assert_unsupported_oid(der: &[u8], expected_arcs: &[u64]) {
+        let err = Ed25519PublicKey::from_spki_der(der).unwrap_err();
+        match &err {
+            ImportPublicKeyError::UnsupportedAlgorithm(oid) => {
+                assert_eq!(oid.arcs(), expected_arcs);
+                // 点分显示必须包含完整标识，包括末尾的段。
+                let dotted: String = expected_arcs
+                    .iter()
+                    .map(|arc| arc.to_string())
+                    .collect::<Vec<_>>()
+                    .join(".");
+                assert_eq!(oid.to_string(), dotted);
+                assert!(err.to_string().contains(&dotted));
+            }
+            other => panic!("expected UnsupportedAlgorithm({expected_arcs:?}), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn canonical_ed25519_small_container_still_imports_unchanged() {
+        // 兼容基线：规范的小容器（全程短形式长度）继续接受，原始字节与
+        // 64 个小写十六进制字符都和以前一致。
+        let key = Ed25519PublicKey::from_spki_der(RFC8410_SPKI).unwrap();
+        assert_eq!(key.as_bytes(), &RFC8410_SPKI[12..]);
+        assert_eq!(key.to_hex(), RFC8410_KEY_HEX);
+        assert_eq!(key.to_hex().len(), 64);
+        assert!(key
+            .to_hex()
+            .chars()
+            .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
+
+        // 用本组构造器按全规范风格拼出的同一容器，字节完全相同。
+        let rebuilt = styled_spki(
+            &[0x2b, 0x65, 0x70],
+            &RFC8410_SPKI[12..],
+            LenStyle::Canonical,
+            LenStyle::Canonical,
+            LenStyle::Canonical,
+        );
+        assert_eq!(rebuilt, RFC8410_SPKI);
+        assert_eq!(
+            Ed25519PublicKey::from_spki_der(&rebuilt).unwrap().as_bytes(),
+            &RFC8410_SPKI[12..]
+        );
+    }
+
+    #[test]
+    fn outer_sequence_crossing_127_128_keeps_unsupported_classification() {
+        // 外层内容恰为 127（短形式 0x7f）与 128（最短长形式 0x81 0x80）：
+        // 算法序列 7 字节 + 位串 TLV，故公钥 117/118 字节时外层内容分别
+        // 为 127/128；两种情况下位串本身都仍是短形式。算法为 Ed448。
+        let at_127 = styled_spki(
+            &[0x2b, 0x65, 0x71],
+            &[0x44; 117],
+            LenStyle::Canonical,
+            LenStyle::Canonical,
+            LenStyle::Canonical,
+        );
+        assert_eq!(&at_127[0..2], &[0x30, 0x7f]);
+        assert_eq!(at_127[9], 0x03);
+        assert_eq!(at_127[10], 0x76); // 位串内容 118
+
+        let at_128 = styled_spki(
+            &[0x2b, 0x65, 0x71],
+            &[0x44; 118],
+            LenStyle::Canonical,
+            LenStyle::Canonical,
+            LenStyle::Canonical,
+        );
+        // 唯一的结构差别就是外层长度从短形式变成最短长形式。
+        assert_eq!(&at_128[0..3], &[0x30, 0x81, 0x80]);
+        assert_eq!(at_128[10], 0x03);
+        assert_eq!(at_128[11], 0x77); // 位串内容 119，仍是短形式
+
+        // 两侧的分类原则必须一致：都是合法的其他算法容器。
+        assert_unsupported_oid(&at_127, &[1, 3, 101, 113]);
+        assert_unsupported_oid(&at_128, &[1, 3, 101, 113]);
+    }
+
+    #[test]
+    fn bit_string_crossing_127_128_keeps_unsupported_classification() {
+        // 位串内容（未使用位数字节 + 公钥）恰为 127/128：公钥 126/127
+        // 字节时位串长度分别是 0x7f 与 0x81 0x80；外层在两侧都已是长形式。
+        let at_127 = styled_spki(
+            &[0x2b, 0x65, 0x71],
+            &[0x44; 126],
+            LenStyle::Canonical,
+            LenStyle::Canonical,
+            LenStyle::Canonical,
+        );
+        assert_eq!(&at_127[0..3], &[0x30, 0x81, 0x88]); // 外层 136
+        assert_eq!(&at_127[10..13], &[0x03, 0x7f, 0x00]);
+
+        let at_128 = styled_spki(
+            &[0x2b, 0x65, 0x71],
+            &[0x44; 127],
+            LenStyle::Canonical,
+            LenStyle::Canonical,
+            LenStyle::Canonical,
+        );
+        assert_eq!(&at_128[0..3], &[0x30, 0x81, 0x8a]); // 外层 138
+        assert_eq!(&at_128[10..14], &[0x03, 0x81, 0x80, 0x00]);
+
+        assert_unsupported_oid(&at_127, &[1, 3, 101, 113]);
+        assert_unsupported_oid(&at_128, &[1, 3, 101, 113]);
+    }
+
+    #[test]
+    fn algorithm_sequence_crossing_127_128_keeps_unsupported_classification() {
+        // 算法序列内容（OID TLV）恰为 127/128：OID 内容 125/126 字节。
+        // 每个内容字节 0x01..=0x7e 都是完整的单子标识符，因此得到 OID
+        // 0.1.2.…（首字节 1 拆成前两段 0 与 1），是合法但不受支持的标识。
+        let oid_125: Vec<u8> = (1..=125).collect();
+        let oid_126: Vec<u8> = (1..=126).collect();
+        let at_127 = styled_spki(
+            &oid_125,
+            &[0x42; 32],
+            LenStyle::Canonical,
+            LenStyle::Canonical,
+            LenStyle::Canonical,
+        );
+        assert_eq!(&at_127[0..3], &[0x30, 0x81, 0xa4]); // 外层 164
+        assert_eq!(&at_127[3..5], &[0x30, 0x7f]); // 算法序列 127，短形式
+        assert_eq!(&at_127[5..7], &[0x06, 0x7d]); // OID 内容 125
+
+        let at_128 = styled_spki(
+            &oid_126,
+            &[0x42; 32],
+            LenStyle::Canonical,
+            LenStyle::Canonical,
+            LenStyle::Canonical,
+        );
+        assert_eq!(&at_128[0..3], &[0x30, 0x81, 0xa6]); // 外层 166
+        assert_eq!(&at_128[3..6], &[0x30, 0x81, 0x80]); // 算法序列 128，长形式
+        assert_eq!(&at_128[6..8], &[0x06, 0x7e]); // OID 内容 126
+
+        // 两侧都报算法不支持；数值、次序与点分显示的末尾都必须保留。
+        let err_127 = Ed25519PublicKey::from_spki_der(&at_127).unwrap_err();
+        match &err_127 {
+            ImportPublicKeyError::UnsupportedAlgorithm(oid) => {
+                assert_eq!(oid.arcs().len(), 126);
+                assert_eq!(&oid.arcs()[..2], &[0, 1]);
+                assert_eq!(oid.arcs().last(), Some(&125));
+                assert_eq!(
+                    oid.to_string(),
+                    (0..=125u64)
+                        .map(|arc| arc.to_string())
+                        .collect::<Vec<_>>()
+                        .join(".")
+                );
+                assert!(oid.to_string().ends_with(".124.125"));
+            }
+            other => panic!("expected UnsupportedAlgorithm, got {other:?}"),
+        }
+        let err_128 = Ed25519PublicKey::from_spki_der(&at_128).unwrap_err();
+        match &err_128 {
+            ImportPublicKeyError::UnsupportedAlgorithm(oid) => {
+                assert_eq!(oid.arcs().len(), 127);
+                assert_eq!(&oid.arcs()[..2], &[0, 1]);
+                assert_eq!(oid.arcs().last(), Some(&126));
+                assert!(oid.to_string().ends_with(".125.126"));
+            }
+            other => panic!("expected UnsupportedAlgorithm, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn all_three_layers_in_canonical_long_form_still_report_unsupported() {
+        // 同一份容器里三层都因内容达到 128 而采用最短长形式：
+        // OID 内容 126（算法序列内容 128）、公钥 127（位串内容 128）、
+        // 外层内容 262（0x106）。
+        let oid_content: Vec<u8> = (1..=126).collect();
+        let der = styled_spki(
+            &oid_content,
+            &[0x44; 127],
+            LenStyle::Canonical,
+            LenStyle::Canonical,
+            LenStyle::Canonical,
+        );
+        assert_eq!(&der[0..4], &[0x30, 0x82, 0x01, 0x06]);
+        assert_eq!(&der[4..7], &[0x30, 0x81, 0x80]);
+        assert_eq!(&der[7..9], &[0x06, 0x7e]);
+        assert_eq!(&der[135..139], &[0x03, 0x81, 0x80, 0x00]);
+        // 对象恰好结束，没有多余字节。
+        assert_eq!(der.len(), 4 + 262);
+
+        let expected_arcs: Vec<u64> = (0..=126).collect();
+        assert_eq!(expected_arcs.len(), 127);
+        let err = Ed25519PublicKey::from_spki_der(&der).unwrap_err();
+        match &err {
+            ImportPublicKeyError::UnsupportedAlgorithm(oid) => {
+                assert_eq!(oid.arcs(), expected_arcs.as_slice());
+                assert!(oid.to_string().ends_with(".125.126"));
+            }
+            other => panic!("expected UnsupportedAlgorithm, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn foreign_algorithm_key_size_never_triggers_ed25519_length_rule() {
+        // “公钥必须 32 字节”只在算法确为 Ed25519 后才检查：Ed448 标识下
+        // 公钥为空、短于 32、恰为 32 或远长于 32（含跨越 128 的长度），
+        // 只要结构完整、DER 规范，分类一律是算法不支持。
+        for key_len in [0usize, 1, 31, 32, 33, 117, 118, 126, 127, 128, 200] {
+            let der = styled_spki(
+                &[0x2b, 0x65, 0x71],
+                &vec![0x44; key_len],
+                LenStyle::Canonical,
+                LenStyle::Canonical,
+                LenStyle::Canonical,
+            );
+            assert_unsupported_oid(&der, &[1, 3, 101, 113]);
+        }
+    }
+
+    #[test]
+    fn ed25519_key_must_still_be_exactly_32_bytes_even_in_long_form_container() {
+        // 算法确为 Ed25519 时，长度约束照旧：31、33 字节以及位串跨入长
+        // 形式的 127 字节公钥都是编码损坏，不截短也不补齐。
+        for key_len in [31usize, 33, 127] {
+            let der = styled_spki(
+                &[0x2b, 0x65, 0x70],
+                &vec![0x22; key_len],
+                LenStyle::Canonical,
+                LenStyle::Canonical,
+                LenStyle::Canonical,
+            );
+            assert_eq!(
+                Ed25519PublicKey::from_spki_der(&der).unwrap_err(),
+                ImportPublicKeyError::Malformed,
+                "Ed25519 key of {key_len} bytes must be Malformed"
+            );
+        }
+        // 恰好 32 字节的规范容器仍然成功。
+        let der = styled_spki(
+            &[0x2b, 0x65, 0x70],
+            &[0x22; 32],
+            LenStyle::Canonical,
+            LenStyle::Canonical,
+            LenStyle::Canonical,
+        );
+        let key = Ed25519PublicKey::from_spki_der(&der).unwrap();
+        assert_eq!(key.as_bytes(), &[0x22; 32]);
+        assert_eq!(key.to_hex(), "22".repeat(32));
+    }
+
+    #[test]
+    fn non_canonical_long_form_lengths_are_malformed_at_every_layer() {
+        // 用一份本应全部短形式的 Ed448 小容器（公钥 40 字节），分别在三个
+        // 位置单独写入非规范长度：能短却长（0x81 前缀）、冗余前导零
+        //（0x82 0x00 前缀）。即使 OID 已可识别为其他算法，也必须报编码
+        // 损坏，不能报算法不支持。
+        for bad_style in [LenStyle::ForcedLong, LenStyle::ForcedLongZeroPadded] {
+            for layer in 0..3 {
+                let (outer, alg, bs) = match layer {
+                    0 => (bad_style, LenStyle::Canonical, LenStyle::Canonical),
+                    1 => (LenStyle::Canonical, bad_style, LenStyle::Canonical),
+                    _ => (LenStyle::Canonical, LenStyle::Canonical, bad_style),
+                };
+                let der = styled_spki(&[0x2b, 0x65, 0x71], &[0x44; 40], outer, alg, bs);
+                assert_eq!(
+                    Ed25519PublicKey::from_spki_der(&der).unwrap_err(),
+                    ImportPublicKeyError::Malformed,
+                    "non-canonical length at layer {layer} must be Malformed"
+                );
+            }
+        }
+
+        // 内容确实达到 128、但最短长形式前再补零字节（0x82 0x00 0x80），
+        // 在外层与位串两个位置同样拒绝。
+        for layer in 0..2 {
+            let (outer, bs) = if layer == 0 {
+                (LenStyle::ForcedLongZeroPadded, LenStyle::Canonical)
+            } else {
+                (LenStyle::Canonical, LenStyle::ForcedLongZeroPadded)
+            };
+            let der = styled_spki(
+                &[0x2b, 0x65, 0x71],
+                &[0x44; 127],
+                outer,
+                LenStyle::Canonical,
+                bs,
+            );
+            assert_eq!(
+                Ed25519PublicKey::from_spki_der(&der).unwrap_err(),
+                ImportPublicKeyError::Malformed
+            );
+        }
+    }
+
+    #[test]
+    fn declared_long_form_length_beyond_remaining_is_malformed_with_known_oid() {
+        // 各层声明的内容长度超过本容器实际剩余内容：一律 Malformed，
+        // 即使 Ed448 标识完整可读，也不能先报算法不支持。
+
+        // 外层用长形式声称 256 字节内容，实际只有一小段。
+        let mut outer_over = vec![0x30, 0x82, 0x01, 0x00, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x71];
+        outer_over.extend_from_slice(&[0x03, 0x03, 0x00, 0x44, 0x44]);
+        assert_eq!(
+            Ed25519PublicKey::from_spki_der(&outer_over).unwrap_err(),
+            ImportPublicKeyError::Malformed
+        );
+
+        // 位串用长形式声称 256 字节内容，但外层只给了 10 字节实际内容——
+        // 嵌套字段不能借用外层容器之后的字节补足自己声明的长度。
+        // 外层内容 = 算法序列 7 + 位串头 4 + 实际位串内容 10 = 21。
+        let mut inner_over =
+            vec![0x30, 0x15, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x71, 0x03, 0x82, 0x01, 0x00];
+        inner_over.extend_from_slice(&[0x00, 0x44, 0x44, 0x44, 0x44, 0x44, 0x44, 0x44, 0x44, 0x44]);
+        assert_eq!(inner_over.len(), 2 + 21);
+        assert_eq!(
+            Ed25519PublicKey::from_spki_der(&inner_over).unwrap_err(),
+            ImportPublicKeyError::Malformed
+        );
+        // 即使在外层之后再补 245 个“看似可借用”的字节，结果仍只能是
+        // 编码损坏（完整对象后带字节先被拒绝），绝不产出算法不支持。
+        let mut padded = inner_over.clone();
+        padded.extend_from_slice(&[0x00; 245]);
+        assert_eq!(
+            Ed25519PublicKey::from_spki_der(&padded).unwrap_err(),
+            ImportPublicKeyError::Malformed
+        );
+
+        // 算法序列声称 32 字节内容，实际在该序列后只剩 10 字节。
+        let alg_over: &[u8] = &[
+            0x30, 0x0d, 0x30, 0x81, 0x20, 0x06, 0x03, 0x2b, 0x65, 0x71, 0x03, 0x04, 0x00, 0x01,
+            0x02,
+        ];
+        assert_eq!(
+            Ed25519PublicKey::from_spki_der(alg_over).unwrap_err(),
+            ImportPublicKeyError::Malformed
+        );
+
+        // OID 声称 32 字节内容，算法序列内实际只有 3 字节。
+        let oid_over: &[u8] = &[
+            0x30, 0x0e, 0x30, 0x06, 0x06, 0x81, 0x20, 0x2b, 0x65, 0x71, 0x03, 0x04, 0x00, 0x01,
+            0x02, 0x03,
+        ];
+        assert_eq!(
+            Ed25519PublicKey::from_spki_der(oid_over).unwrap_err(),
+            ImportPublicKeyError::Malformed
+        );
+
+        // 极大的声明长度（u64::MAX 与超 8 字节的长度头）也只能安静失败，
+        // 不能因长度运算溢出而崩溃。
+        let mut huge = vec![0x30, 0x88, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff];
+        huge.extend_from_slice(&[0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x71]);
+        assert_eq!(
+            Ed25519PublicKey::from_spki_der(&huge).unwrap_err(),
+            ImportPublicKeyError::Malformed
+        );
+    }
+
+    #[test]
+    fn truncated_and_trailing_bytes_around_long_form_are_malformed() {
+        // 一份三层中两层（外层、位串）使用规范长形式的完整 Ed448 容器。
+        let der = styled_spki(
+            &[0x2b, 0x65, 0x71],
+            &[0x44; 127],
+            LenStyle::Canonical,
+            LenStyle::Canonical,
+            LenStyle::Canonical,
+        );
+        assert_eq!(&der[0..3], &[0x30, 0x81, 0x8a]);
+        assert_eq!(&der[10..14], &[0x03, 0x81, 0x80, 0x00]);
+
+        // 任何真前缀都不是完整对象：空输入、长度字节被截断（30 81、
+        // 30 81 8a）、内容被截断等所有切点都必须报 Malformed——既不能
+        // 成功，也不能因为已读到 Ed448 标识就报算法不支持，更不能崩溃。
+        for cut in 0..der.len() {
+            assert_eq!(
+                Ed25519PublicKey::from_spki_der(&der[..cut]).unwrap_err(),
+                ImportPublicKeyError::Malformed,
+                "prefix of length {cut} must be Malformed"
+            );
+        }
+
+        // 完整对象之后多一个字节同样拒绝。
+        let mut trailing = der.clone();
+        trailing.push(0x00);
+        assert_eq!(
+            Ed25519PublicKey::from_spki_der(&trailing).unwrap_err(),
+            ImportPublicKeyError::Malformed
+        );
+
+        // 长度头声明的字节数本身还没读全。
+        assert_eq!(
+            Ed25519PublicKey::from_spki_der(&[0x30, 0x82, 0x01]).unwrap_err(),
+            ImportPublicKeyError::Malformed
+        );
+        assert_eq!(
+            Ed25519PublicKey::from_spki_der(&[0x30, 0x84, 0x01, 0x00]).unwrap_err(),
+            ImportPublicKeyError::Malformed
+        );
+    }
+
+    #[test]
+    fn indefinite_and_too_long_length_coders_are_malformed_at_every_layer() {
+        // 不定长形式（0x80）：出现在哪一层都拒绝。
+        assert_eq!(
+            Ed25519PublicKey::from_spki_der(&[0x30, 0x80, 0x00, 0x00]).unwrap_err(),
+            ImportPublicKeyError::Malformed
+        );
+        // 算法序列位置：外层完整，内部 30 80。
+        let indefinite_alg: &[u8] = &[
+            0x30, 0x0c, 0x30, 0x80, 0x06, 0x03, 0x2b, 0x65, 0x71, 0x03, 0x03, 0x00, 0xaa, 0xbb,
+        ];
+        assert_eq!(
+            Ed25519PublicKey::from_spki_der(indefinite_alg).unwrap_err(),
+            ImportPublicKeyError::Malformed
+        );
+        // 位串位置：03 80。
+        let indefinite_bs: &[u8] = &[
+            0x30, 0x09, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x71, 0x03, 0x80,
+        ];
+        assert_eq!(
+            Ed25519PublicKey::from_spki_der(indefinite_bs).unwrap_err(),
+            ImportPublicKeyError::Malformed
+        );
+        // 长度字节数超过 8（0x89 表示 9 字节长度）直接拒绝，不崩溃。
+        assert_eq!(
+            Ed25519PublicKey::from_spki_der(&[0x30, 0x89, 0x01, 0x00, 0x00]).unwrap_err(),
+            ImportPublicKeyError::Malformed
+        );
+    }
 }
