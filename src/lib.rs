@@ -414,14 +414,20 @@ fn read_der_tlv(data: &[u8]) -> Option<(u8, &[u8], &[u8])> {
 /// 把 OID 的 DER 内容字节解码为各段弧的数值。
 ///
 /// 只接受规范编码：内容非空，每个子标识符按最短形式编码（不允许
-/// 前导的 0x80 字节），最后一个子标识符必须完整结束，弧的数值
-/// 不得溢出。
+/// 前导的 0x80 字节），最后一个子标识符必须完整结束。每段弧的数值
+/// 必须在 [`u64`] 范围内，超出即按编码损坏处理。
+///
+/// 注意第一个子标识符合并编码前两段弧（`40*arc0 + arc1`）：首段为 2
+/// 时第二段无上界，合并值本身可达 `80 + u64::MAX`（略超 `u64`），
+/// 因此累加使用更宽的类型，越界判断针对还原后的各段弧，而不是合并值。
 fn decode_oid(content: &[u8]) -> Option<ObjectIdentifier> {
     if content.is_empty() {
         return None;
     }
-    let mut subidentifiers: Vec<u64> = Vec::new();
-    let mut value: u64 = 0;
+    // 合并编码的第一个子标识符在首段为 2 时最大可达 80 + u64::MAX，
+    // 超过 u64，故用 u128 累加；是否越界稍后按还原后的每段弧判断。
+    let mut subidentifiers: Vec<u128> = Vec::new();
+    let mut value: u128 = 0;
     let mut in_arc = false;
     for &b in content {
         if !in_arc {
@@ -431,10 +437,10 @@ fn decode_oid(content: &[u8]) -> Option<ObjectIdentifier> {
             }
             in_arc = true;
         }
-        if value > (u64::MAX >> 7) {
-            return None;
-        }
-        value = (value << 7) | u64::from(b & 0x7f);
+        // 用 checked 运算逐位累加：任一段超过 u128（连 u64 弧可能
+        // 需要的宽度都远远装不下）都按编码损坏处理，绝不回绕截断。
+        let digit = u128::from(b & 0x7f);
+        value = value.checked_mul(1 << 7)?.checked_add(digit)?;
         if b & 0x80 == 0 {
             subidentifiers.push(value);
             value = 0;
@@ -447,18 +453,27 @@ fn decode_oid(content: &[u8]) -> Option<ObjectIdentifier> {
     }
     let (&first, rest) = subidentifiers.split_first()?;
     // 第一个子标识符合并编码前两段弧：0..=39 → 0.x，40..=79 → 1.x，
-    // 其余 → 2.x。
-    let (arc0, arc1) = if first < 40 {
+    // 其余 → 2.x。首段为 2 时合并值允许略超 u64（最多 80 + u64::MAX），
+    // 必须按还原后的第二段判断是否在 u64 范围内。
+    let (arc0, arc1): (u64, u128) = if first < 40 {
         (0, first)
     } else if first < 80 {
         (1, first - 40)
     } else {
-        (2, first - 80)
+        let arc1 = first - 80;
+        if arc1 > u128::from(u64::MAX) {
+            return None;
+        }
+        (2, arc1)
     };
     let mut arcs = Vec::with_capacity(rest.len() + 2);
     arcs.push(arc0);
-    arcs.push(arc1);
-    arcs.extend_from_slice(rest);
+    arcs.push(u64::try_from(arc1).ok()?);
+    for &subidentifier in rest {
+        // 除首段合并编码外，每个子标识符直接就是一段弧：超出 u64
+        // 即属于本类型不支持的表示，按编码损坏处理。
+        arcs.push(u64::try_from(subidentifier).ok()?);
+    }
     Some(ObjectIdentifier(arcs))
 }
 
@@ -1444,5 +1459,181 @@ mod tests {
         assert_ne!(malformed, unsupported);
         let boxed: Box<dyn std::error::Error> = Box::new(unsupported);
         assert!(boxed.to_string().contains("1.3.101.110"));
+    }
+
+    /// 按 OID base-128 规则编码一个子标识符（含续位，高位在前）。
+    fn base128_encode(mut value: u128) -> Vec<u8> {
+        let mut bytes = vec![(value as u8) & 0x7f];
+        value >>= 7;
+        while value > 0 {
+            bytes.push(0x80 | ((value as u8) & 0x7f));
+            value >>= 7;
+        }
+        bytes.reverse();
+        bytes
+    }
+
+    /// 按各段弧构造 OID 内容字节；首段须为 0、1 或 2。
+    /// 用 u128 传参，以便构造第二段或后续段超出 u64 的输入。
+    fn oid_content(arcs: &[u128]) -> Vec<u8> {
+        assert!(!arcs.is_empty());
+        let first = 40 * arcs[0] + arcs[1];
+        let mut content = base128_encode(first);
+        for &arc in &arcs[2..] {
+            content.extend_from_slice(&base128_encode(arc));
+        }
+        content
+    }
+
+    #[test]
+    fn first_arc_two_with_second_arc_at_u64_max_is_unsupported_not_malformed() {
+        // 2.18446744073709551615.3：前两段合并为 80 + 2^64-1 = 2^64+79，
+        // 略超 u64，但每段弧本身都在公开的 u64 表示范围内；编码完整规范。
+        let content = oid_content(&[2, u128::from(u64::MAX), 3]);
+        // 独立核对：合并子标识符 2^64+79 的 base-128 编码以 0x82 0x80
+        // 开头，共 10 个字节，随后才是末段 3。
+        assert_eq!(content.len(), 11);
+        assert_eq!(&content[..2], &[0x82, 0x80]);
+        assert_eq!(*content.last().unwrap(), 0x03);
+
+        let der = spki_der(&content, &[0x42; 32]);
+        let err = Ed25519PublicKey::from_spki_der(&der).unwrap_err();
+        match &err {
+            ImportPublicKeyError::UnsupportedAlgorithm(oid) => {
+                assert_eq!(oid.arcs(), &[2, u64::MAX, 3]);
+                assert_eq!(oid.to_string(), "2.18446744073709551615.3");
+            }
+            other => panic!("expected UnsupportedAlgorithm, got {other:?}"),
+        }
+        let msg = err.to_string();
+        assert!(msg.contains("2.18446744073709551615.3"), "message: {msg}");
+        assert!(msg.contains("1.3.101.112"), "message: {msg}");
+    }
+
+    #[test]
+    fn second_arc_near_u64_max_range_and_neighbors_all_classified_correctly() {
+        // 第二段从 18446744073709551536（u64::MAX-79）到 u64::MAX，
+        // 以及区间两侧的相邻可表示值：只要第二段仍在 u64 内就是
+        // UnsupportedAlgorithm，数值必须原样保留，不得截断或回绕。
+        for second in [
+            u64::MAX - 80, // 区间下沿的相邻值
+            u64::MAX - 79,
+            u64::MAX - 1,
+            u64::MAX,
+        ] {
+            let content = oid_content(&[2, u128::from(second), 3]);
+            let der = spki_der(&content, &[0x42; 32]);
+            match Ed25519PublicKey::from_spki_der(&der).unwrap_err() {
+                ImportPublicKeyError::UnsupportedAlgorithm(oid) => {
+                    assert_eq!(oid.arcs(), &[2, second, 3]);
+                    assert_eq!(oid.to_string(), format!("2.{second}.3"));
+                }
+                other => panic!("2.{second}.3 must be UnsupportedAlgorithm: {other:?}"),
+            }
+        }
+
+        // 第二段越过 u64 上界（u64::MAX+1）：真正超出单段 u64 表示范围，
+        // 仍按既有约定报 Malformed，不能变成算法不支持。
+        let over = oid_content(&[2, u128::from(u64::MAX) + 1, 3]);
+        let der = spki_der(&over, &[0x42; 32]);
+        assert_eq!(
+            Ed25519PublicKey::from_spki_der(&der).unwrap_err(),
+            ImportPublicKeyError::Malformed
+        );
+    }
+
+    #[test]
+    fn later_arcs_beyond_u64_remain_malformed_without_panicking() {
+        // 首段合并编码完全普通，溢出的是后面的单段子标识符：仍报 Malformed。
+        let over = oid_content(&[1, 3, u128::from(u64::MAX) + 1]);
+        let der = spki_der(&over, &[0x42; 32]);
+        assert_eq!(
+            Ed25519PublicKey::from_spki_der(&der).unwrap_err(),
+            ImportPublicKeyError::Malformed
+        );
+
+        // 子标识符远超 u128 容量（20 个续位字节，覆盖约 140 个比特）：
+        // 必须平静地报 Malformed，不能因累加溢出而 panic 或回绕。
+        let mut huge = vec![0x2b];
+        huge.extend(std::iter::repeat(0x80).take(20));
+        huge.push(0x01);
+        let der = spki_der(&huge, &[0x42; 32]);
+        assert_eq!(
+            Ed25519PublicKey::from_spki_der(&der).unwrap_err(),
+            ImportPublicKeyError::Malformed
+        );
+    }
+
+    #[test]
+    fn all_arcs_after_large_second_arc_keep_values_and_order() {
+        // 2.u64MAX.3.200.4：第二段贴着上界，其后还有若干合法段，
+        // 各段数值与先后次序都必须原样保留（200 编码为 0x81 0x48）。
+        let content = oid_content(&[2, u128::from(u64::MAX), 3, 200, 4]);
+        let der = spki_der(&content, &[0x42; 32]);
+        let err = Ed25519PublicKey::from_spki_der(&der).unwrap_err();
+        match &err {
+            ImportPublicKeyError::UnsupportedAlgorithm(oid) => {
+                assert_eq!(oid.arcs(), &[2, u64::MAX, 3, 200, 4]);
+                assert_eq!(
+                    oid.to_string(),
+                    "2.18446744073709551615.3.200.4"
+                );
+            }
+            other => panic!("expected UnsupportedAlgorithm, got {other:?}"),
+        }
+        assert!(err
+            .to_string()
+            .contains("2.18446744073709551615.3.200.4"));
+    }
+
+    #[test]
+    fn strict_der_rules_still_enforced_for_identifiers_near_u64_max() {
+        // 完整的 2.u64MAX.3 容器作为基准。
+        let good = spki_der(&oid_content(&[2, u128::from(u64::MAX), 3]), &[0x42; 32]);
+        assert!(matches!(
+            Ed25519PublicKey::from_spki_der(&good).unwrap_err(),
+            ImportPublicKeyError::UnsupportedAlgorithm(_)
+        ));
+
+        // 冗余前导零出现在第一个子标识符（0x80 开头）：非规范，Malformed。
+        let mut padded_first = oid_content(&[2, u128::from(u64::MAX), 3]);
+        padded_first.insert(0, 0x80);
+        let der = spki_der(&padded_first, &[0x42; 32]);
+        assert_eq!(
+            Ed25519PublicKey::from_spki_der(&der).unwrap_err(),
+            ImportPublicKeyError::Malformed
+        );
+
+        // 冗余前导零出现在末段（3 写成 0x80 0x03）：同样 Malformed。
+        let mut padded_last = oid_content(&[2, u128::from(u64::MAX)]);
+        padded_last.extend_from_slice(&[0x80, 0x03]);
+        let der = spki_der(&padded_last, &[0x42; 32]);
+        assert_eq!(
+            Ed25519PublicKey::from_spki_der(&der).unwrap_err(),
+            ImportPublicKeyError::Malformed
+        );
+
+        // 末段子标识符续位未结束：合并子标识符（2.u64MAX）完整，
+        // 随后只给一个带续位的字节 0x81 却没有收尾字节。
+        let mut unterminated = oid_content(&[2, u128::from(u64::MAX)]);
+        unterminated.push(0x81);
+        let der = spki_der(&unterminated, &[0x42; 32]);
+        assert_eq!(
+            Ed25519PublicKey::from_spki_der(&der).unwrap_err(),
+            ImportPublicKeyError::Malformed
+        );
+
+        // 容器截断：外层声明的内容不完整。
+        assert_eq!(
+            Ed25519PublicKey::from_spki_der(&good[..good.len() - 5]).unwrap_err(),
+            ImportPublicKeyError::Malformed
+        );
+        // 对象之后多出字节。
+        let mut trailing = good.clone();
+        trailing.push(0x00);
+        assert_eq!(
+            Ed25519PublicKey::from_spki_der(&trailing).unwrap_err(),
+            ImportPublicKeyError::Malformed
+        );
     }
 }
